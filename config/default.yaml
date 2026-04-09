@@ -1,0 +1,42 @@
+elasticsearch:
+  url: "http://172.17.123.119:9200"
+  index: "science_docs"
+
+qdrant:
+  url: "http://localhost:6333"
+  collection: "science_docs"
+  vector_size: 4096
+
+paths:
+  documents: "data/documents.jsonl"
+  eval: "data/eval.jsonl"
+  user_dict_out: "artifacts/user_dict.txt"
+
+# 리더보드 채점은 topk 상위 3개 사용 (baseline_code README)
+submission_top_k: 3
+
+embedding:
+  model_name: "Qwen/Qwen3-Embedding-8B"
+  query_instruction: 'Instruct: Given a scientific question, retrieve relevant passages that answer the query\nQuery: '
+  text_instruction: "Represent this scientific document for retrieval: "
+  max_length: 8192
+  trust_remote_code: true # Qwen 모델은 true 필요
+
+# Reranker (선택) — scripts/export_submission.py --pipeline 시 사용
+# 초반 실험: Qwen/Qwen3-Reranker-4B (~10GB)
+# 최종 제출: Qwen/Qwen3-Reranker-8B (~18GB)
+reranker:
+  model_name: "Qwen/Qwen3-Reranker-8B"
+  trust_remote_code: true # Qwen 모델은 true 필요
+
+# vLLM 서빙 URL (선택) — scripts/serve_vllm.py 기동 후 설정
+# 미설정 시 HuggingFaceLLM 직접 로드
+# vllm:
+#   url: "http://localhost:8000"
+#   model_name: "science-rag"
+
+# 로컬 LLM (vllm 미설정 시 사용)
+llm:
+  model_name: "Qwen/Qwen3.5-4B"
+  max_new_tokens: 512
+  context_window: 4096
