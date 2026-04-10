@@ -118,13 +118,13 @@ eval.jsonl (220건: 단일 200 / 멀티턴 20)
 ② 문서 검색 (Hybrid Retrieval)
     Sparse: Elasticsearch BM25 + Nori(mixed) + MeCab 전문 용어 사전
     Dense:  Qwen3-Embedding-8B + Qdrant (HNSW)
-    원본 쿼리 + HyDE → RRF(k=60) 3축 병합 → Top-100
+    원본 쿼리 + HyDE → RRF(k=20) 3축 병합 → Top-20
     │
     ▼
 ③ 재순위화 (Reranking)
     Qwen3-Reranker-8B Cross-Encoder
     + Soft Voting (Reranker 0.7 : RRF 0.3)
-    → Top-10~20
+    → Top-10
     │
     ▼
 ④ LLM 응답 생성
@@ -144,6 +144,42 @@ eval.jsonl (220건: 단일 200 / 멀티턴 20)
 ## 단계별 기술 스택
 
 ### ① 쿼리 전처리 (Query Preprocessing)
+
+멀티 턴 쿼리(20건)를 검색에 적합한 단일 쿼리로 변환하고, 치챗/과학 분류를 수행합니다.
+
+#### 치챗 / 과학 분류 (`is_science_question`)
+
+2단계 판별 구조로 4B 모델의 오판을 보완합니다:
+
+1. **규칙 기반 pre-filter** (`_SCIENCE_PREFILTER_RE`) — LLM 호출 없이 즉시 True 반환  
+   `뭐야, 이유, 원인, 어떻게, 왜, 알려줘, 어디야, 누구야, 이로운, 나열, 어떤 편, 높다/많다` 등 지식 탐색 패턴 감지
+2. **LLM 판별** — 모호한 케이스만 LLM 호출  
+   도메인 범위: 과학·기술·학문·사회·경제·역사·문화·교육·의학·농업·원예·IT·코딩  
+   멀티턴: 전체 대화 맥락 포함, Few-shot 예시 9개(yes) + 4개(no) 제공
+
+```python
+_SCIENCE_PREFILTER_RE = re.compile(
+    r"(?:뭐야|뭔지|뭔가|무엇|어떻게|왜\b|이유|원인|차이[는가]?|"
+    r"알려줘|설명해|노하우|방법|과정|원리|특징|종류|역할|효과|장단점|"
+    r"이로운|해로운|유익|유해|나열|어떤\s*편|어느\s*정도|"
+    r"높[다은]|낮[다은]|많[다은]|적[다은]|"
+    r"어디야|어디에|어디서|어디[가이]|누구야|누구인|얼마나|몇\s)",
+    re.IGNORECASE,
+)
+
+def is_science_question(msg, llm):
+    last = next((m["content"] for m in reversed(msg) if m["role"] == "user"), "")
+    # Step 1: 규칙 pre-filter
+    if _SCIENCE_PREFILTER_RE.search(last):
+        return True   # LLM 호출 없음
+    # Step 2: LLM 판별 (few-shot + 도메인 확장 프롬프트)
+    ...
+```
+
+Phase 0 완료 후 결과를 `artifacts/phase0_queries.csv`에 중간 저장합니다  
+(eval_id / is_science / standalone / hyde_doc / alt_query).
+
+#### 멀티턴 쿼리 재작성 (`build_search_query`)
 
 멀티 턴 쿼리(20건)를 검색에 적합한 단일 쿼리로 변환합니다.
 Few-shot 예시로 LLM이 과학 도메인 의도를 과도하게 확장하지 않도록 제어합니다.
@@ -251,7 +287,8 @@ def hybrid_search_with_hyde(query: str, llm, retriever_fn,
     return rrf_score([results_original, results_hyde, results_alt])
 
 
-def rrf_score(rankings: list[list[str]], k: int = 60) -> dict[str, float]:
+def rrf_score(rankings: list[list[str]], k: int = 20) -> dict[str, float]:
+    # k=20: Top-20 후보군에서 점수 분산 극대화 (논문 권장 k=60은 Top-1000 대상)
     scores = {}
     for ranking in rankings:
         for rank, doc_id in enumerate(ranking):
@@ -268,38 +305,56 @@ def rrf_score(rankings: list[list[str]], k: int = 60) -> dict[str, float]:
 | 희소 검색 | Elasticsearch / BM25 | 전문 용어·정확 매칭 |
 | 한국어 형태소 분석 | Elasticsearch Nori + MeCab | Ubuntu 환경 권장 |
 | 밀집 검색 | Qdrant + ANN (HNSW) | 의미 기반 검색 |
-| 결과 병합 | RRF (k=60) | Sparse + Dense + HyDE 3축 통합 |
+| 결과 병합 | **RRF (k=20)** | 원본+HyDE+alt_query 3축 통합 |
+| 동의어 처리 | ES synonym filter | 이태리↔이탈리아 등 이표기 처리 |
 
 #### 인덱싱 — docid 단위 직접 색인
 
+ES 분석기는 **색인용(korean_analyzer)** 과 **검색용(korean_search_analyzer)** 을 분리합니다.  
+동의어(`KOREAN_SYNONYMS`)는 검색 시에만 확장하여 인덱스 팽창을 방지합니다.
+
 ```python
-import json
-from elasticsearch import Elasticsearch
-from elasticsearch.helpers import bulk
+# es_util.py 의 실제 설정 구조 요약
+KOREAN_SYNONYMS = [
+    "이태리, 이탈리아",      # 국가명 이표기
+    "미국, 미합중국",
+    "예외처리, 예외 처리",   # IT 복합어 띄어쓰기 변이
+    "인공지능, 인공 지능",
+    "온실효과, 온실 효과",   # 과학 복합어
+    # ... (21개)
+]
 
-es = Elasticsearch("http://localhost:9200")
-
-# Nori 사용자 사전:
-#  - 파일 방식: ES 노드의 config 경로(예: config/user_dict.txt)에 두고
-#    tokenizer 설정에서 "user_dictionary": "user_dict.txt" (상대 경로는 config 기준)
-#  - 직접 설치 시 /etc/elasticsearch/ 하위가 config 루트 (경로 상대 기준)
-#  - 빠른 실험: "user_dictionary_rules" 에 용어를 한 줄씩 나열 (아래 주석 예시)
 index_settings = {
     "analysis": {
-        "analyzer": {
-            "korean_analyzer": {
-                "type": "custom",
-                "tokenizer": "nori_tok",
-                "filter": ["nori_part_of_speech", "lowercase"],
+        "char_filter": {
+            "space_normalizer": {             # 연속 공백 정규화 (양쪽 적용)
+                "type": "pattern_replace",
+                "pattern": " {2,}", "replacement": " ",
             }
         },
-        "tokenizer": {
-            "nori_tok": {
-                "type": "nori_tokenizer",
-                "decompound_mode": "mixed",
-                # "user_dictionary": "user_dict.txt",
-                # "user_dictionary_rules": ["양자역학", "파동함수"],
+        "filter": {
+            "korean_synonyms": {              # 검색 시에만 동의어 확장
+                "type": "synonym",
+                "synonyms": KOREAN_SYNONYMS,
+                "updateable": True,
             }
+        },
+        "analyzer": {
+            "korean_analyzer": {              # 색인용
+                "type": "custom",
+                "char_filter": ["space_normalizer"],
+                "tokenizer": "nori_tok",
+                "filter": ["nori_part_of_speech", "lowercase"],
+            },
+            "korean_search_analyzer": {       # 검색용 (동의어 포함)
+                "type": "custom",
+                "char_filter": ["space_normalizer"],
+                "tokenizer": "nori_tok",
+                "filter": ["nori_part_of_speech", "lowercase", "korean_synonyms"],
+            },
+        },
+        "tokenizer": {
+            "nori_tok": {"type": "nori_tokenizer", "decompound_mode": "mixed"}
         },
     }
 }
@@ -307,33 +362,16 @@ mappings = {
     "properties": {
         "docid":   {"type": "keyword"},
         "src":     {"type": "keyword"},
-        "content": {"type": "text", "analyzer": "korean_analyzer"},
+        "content": {
+            "type": "text",
+            "analyzer": "korean_analyzer",
+            "search_analyzer": "korean_search_analyzer",  # 검색 시 동의어 확장
+        },
     }
 }
-
-# elasticsearch-py 8.x: indices.create(settings=..., mappings=..., ignore_unavailable 등)
-if not es.indices.exists(index="science_docs"):
-    es.indices.create(index="science_docs", settings=index_settings, mappings=mappings)
-
-def gen_actions(filepath: str):
-    with open(filepath, encoding="utf-8") as f:
-        for line in f:
-            doc = json.loads(line.strip())
-            if not doc:
-                continue
-            yield {
-                "_index": "science_docs",
-                "_id": doc["docid"],
-                "_source": {
-                    "docid": doc["docid"],
-                    "src": doc["src"],
-                    "content": doc["content"],
-                },
-            }
-
-bulk(es, gen_actions("documents.jsonl"))
-es.indices.refresh(index="science_docs")
 ```
+
+> 분석기·동의어 변경 후에는 `python scripts/index_es.py --recreate`로 재색인하세요.
 
 #### 한국어 형태소 분석 — Nori + MeCab
 
@@ -583,51 +621,35 @@ def soft_voting_rerank(rrf_scores: dict[str, float],
 | SFT 프레임워크 | Unsloth | 1.5× 속도, 50% VRAM 절약 |
 | 내보내기 | GGUF Q4_K_M | 추론 시 ~6GB |
 
-**SFT 데이터 변환**
+**SFT 데이터 생성 (`scripts/build_sft_data.py`)**
 
-```python
-import json
+5가지 개선사항이 포함된 생성 파이프라인입니다:
 
-def build_sft_dataset(eval_path: str, doc_path: str,
-                      retriever, llm=None, out_path: str = "sft_data.jsonl") -> None:
-    doc_map = {}
-    with open(doc_path, encoding="utf-8") as f:
-        for line in f:
-            d = json.loads(line.strip())
-            doc_map[d["docid"]] = d["content"]
+1. **BM25 최소 점수 필터** (`--min-bm25-score`): 절대 임계값 미달 문서 제외, 전부 미달 시 top-1 유지
+2. **상대 점수 필터** (`--rel-score-ratio`): top-1 대비 70% 미만 문서 제거 (노이즈 방지)
+3. **최소 문서 보증** (`--min-docs`): 필터 후 부족하면 Solar API로 paraphrase 생성해 보충
+4. **치챗 제외** (`--phase0-csv`): Phase 0 결과 CSV를 읽어 `is_science=False` 샘플 건너뜀
+5. **외부 API 답변 생성** (`--answer-api`): Solar / OpenAI / Google Gemini로 답변 자동 생성, LaTeX·마크다운 자동 제거
 
-    sft_records = []
-    with open(eval_path, encoding="utf-8") as f:
-        for line in f:
-            sample = json.loads(line.strip())
-            msg    = sample["msg"]
-            # 멀티 턴 검색 쿼리 전략은 학습 데이터에도 동일하게 적용 (①절과 일치)
-            query  = build_search_query(msg, llm=llm)
-
-            top_docids = retriever(query, top_k=5)
-            context = "\n\n".join(
-                f"[문서 {i+1}] {doc_map[did]}"
-                for i, did in enumerate(top_docids) if did in doc_map
-            )
-
-            messages = [{"role": "system", "content":
-                "당신은 과학 전문가입니다. 제공된 참고 문서를 근거로 질문에 답하세요. "
-                "문서에 없는 내용은 절대 추측하지 마세요."}]
-
-            for m in msg[:-1]:
-                messages.append({"role": m["role"], "content": m["content"]})
-
-            messages.append({"role": "user",
-                "content": f"참고 문서:\n{context}\n\n질문: {msg[-1]['content']}"})
-
-            sft_records.append({"messages": messages})
-
-    with open(out_path, "w", encoding="utf-8") as f:
-        for rec in sft_records:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-
-    print(f"SFT 데이터 생성 완료: {len(sft_records)}건 → {out_path}")
+```bash
+# Phase 0 CSV 재활용 + 상대 점수 필터 + paraphrase 보충 + Solar API 답변 생성
+python scripts/build_sft_data.py \
+    --phase0-csv     artifacts/phase0_queries.csv \
+    --min-bm25-score 1.0 \
+    --rel-score-ratio 0.7 \
+    --min-docs       3 \
+    --answer-api     solar --answer-model solar-pro
 ```
+
+| 옵션 | 기본값 | 설명 |
+|------|--------|------|
+| `--phase0-csv` | 없음 | 치챗 제외·standalone 쿼리 재활용 |
+| `--min-bm25-score` | 1.0 | BM25 절대 점수 임계값 (0=비활성화) |
+| `--rel-score-ratio` | 0.7 | top-1 대비 유지 비율. 미달 문서 제거 (0=비활성화) |
+| `--min-docs` | 3 | 최소 문서 수. 부족하면 paraphrase로 보충 |
+| `--top-k` | 5 | 검색할 최대 문서 수 |
+| `--answer-api` | 없음 | `solar` / `openai` / `google` |
+| `--answer-model` | API별 기본값 | 직접 지정 시 사용 |
 
 **Unsloth SFT**
 
@@ -1096,32 +1118,33 @@ answer = llm.generate(build_prompt(top20, query))
 eval.jsonl (220건: 단일 200 / 멀티턴 20)
     │
     ▼
-[쿼리 전처리]
-  단일 턴: 마지막 user 발화 그대로
-  멀티 턴: Few-shot LLM 재작성 → 품질 검증 → 실패 시 원본 fallback
+[Phase 0: 쿼리 전처리] — LLM 4B
+  치챗/과학 분류: ① 규칙 pre-filter → ② LLM 판별 (도메인 확장 + Few-shot)
+  과학: 멀티턴 LLM 재작성 + HyDE doc · alt_query 생성
+  → artifacts/phase0_queries.csv 중간 저장
     │
-    ├──────────────────────────────────┐
-    ▼ (원본 쿼리, 항상 실행)           ▼ (BM25 score < threshold 일 때만)
-[Sparse 검색]                     [Dense 검색 + 조건부 HyDE]
-Elasticsearch BM25                 Qwen3-Embedding-8B
-+ Nori(mixed) + MeCab 전문 용어 사전 + Qdrant (HNSW) + diskcache
-    │                                  │
-    └──────────────┬───────────────────┘
-                   ▼
-           [RRF 병합 k=60]
-                   ▼
-           [Reranking]
-       Qwen3-Reranker-4B (실험) / 8B (최종)
-        Top-100 → Top-20
-       + Soft Voting (실험 검증 후)
-                   ▼
-           [LLM 생성]
-       Qwen3.5-4B (SFT) / CRAG·CoT 프롬프트
-       + Self-check (Faithfulness < threshold → 재생성)
-                   ▼
-           [MAP 평가]
-       relevance_map 사전 구축 (BM25 Heuristic → Pseudo Labeling)
-       evaluate_map() + RAGAS + LangSmith
+    ├─ 치챗 → [Phase 3] generate_chitchat() 직행
+    │
+    ▼ (과학 질문만)
+[Phase 1: 하이브리드 검색] — Embedding 8B
+  Sparse: ES BM25 + Nori(mixed) + 사용자 사전 + 동의어(KOREAN_SYNONYMS)
+  Dense:  Qwen3-Embedding-8B + Qdrant (HNSW)
+  3축 RRF(k=20): 원본 + HyDE + alt_query → Top-20
+    │
+    ▼
+[Phase 2: 재순위화] — Reranker 8B
+  Qwen3-Reranker-8B Cross-Encoder
+  + Soft Voting (Reranker 0.7 : RRF 0.3) → Top-N
+    │
+    ▼
+[Phase 3: LLM 생성] — LLM 4B
+  과학: CRAG·CoT 프롬프트 + Self-check (RAGAS Faithfulness, Google AI / OpenAI)
+  치챗: generate_chitchat()
+    │
+    ▼
+[평가]
+  MAP · MRR · NDCG (run_retrieval_eval.py)
+  RAGAS (ragas_eval.py) + LangSmith
 
 참조: documents.jsonl (4,272건 / docid 단위 / 평균 315자)
 ```
@@ -1228,7 +1251,7 @@ def cached_rerank(query: str, candidate_ids: list[str], rerank_fn) -> list[str]:
 **검색**
 - [ ] BM25 단독 / Dense 단독 / 하이브리드 / 3축 RRF MAP 비교
 - [ ] HyDE 조건부 실행 hyde_threshold 튜닝 (2 / 5 / 10)
-- [ ] RRF k값 튜닝 (기본 60, 실험적으로 20~120)
+- [x] RRF k값 튜닝 → **k=20** 적용 (Top-20 후보군에 최적화)
 
 **리랭킹**
 - [ ] Reranker 4B vs 8B MAP 비교

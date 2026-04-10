@@ -93,7 +93,7 @@ def qdrant_dense_doc_ids(
 
 def rrf_score(
     rankings: list[list[str]],
-    k: int = 60,
+    k: int = 20,
 ) -> dict[str, float]:
     """여러 검색 결과 랭킹을 RRF 공식으로 통합하여 점수 딕셔너리를 반환한다.
 
@@ -138,13 +138,15 @@ def generate_hyde_doc(query: str, llm: Any) -> str:
     Returns
     -------
     str
-        생성된 가상 문서 텍스트.
+        생성된 가상 문서 텍스트 (<think> 블록 제거 완료).
     """
+    import re
     prompt = (
         "다음 과학 질문에 대한 정확한 설명 문단을 100자 내외로 작성하세요.\n"
         f"질문: {query}\n설명:"
     )
-    return llm.complete(prompt).text.strip()
+    raw = llm.complete(prompt).text
+    return re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
 
 
 def hybrid_search_with_hyde(

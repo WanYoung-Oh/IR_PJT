@@ -23,6 +23,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", default="config/default.yaml")
     parser.add_argument("--input", default=None, help="Override documents jsonl path")
+    parser.add_argument("--recreate", action="store_true",
+                        help="인덱스를 삭제 후 재생성 (설정 변경 시 사용)")
     args = parser.parse_args()
     root = repo_root_from(Path.cwd())
     cfg = load_config(resolve_config_path(root, args.config))
@@ -33,7 +35,24 @@ def main() -> None:
         doc_path = root / doc_path
 
     es = Elasticsearch(es_url)
-    ensure_index(es, index)
+
+    # 사용자 사전 로드 (artifacts/user_dict.txt)
+    user_dict_rules: list[str] | None = None
+    user_dict_path = root / cfg["paths"].get("user_dict_out", "artifacts/user_dict.txt")
+    if user_dict_path.exists():
+        # user_dictionary_rules 인라인 포맷: 단어만 (품사 태그 제외)
+        # "단어\tNNG" → "단어"  (NNG 등 품사를 넣으면 분해로 오인해 BadRequestError 발생)
+        rules = [
+            line.strip().split("\t")[0]
+            for line in user_dict_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        user_dict_rules = rules or None
+        print(f"사용자 사전 로드: {len(rules)}개 → {user_dict_path}")
+    else:
+        print(f"사용자 사전 없음 — 기본 Nori 사용 ({user_dict_path})")
+
+    ensure_index(es, index, recreate=args.recreate, user_dict_rules=user_dict_rules)
 
     def actions():
         for doc in iter_jsonl(doc_path):

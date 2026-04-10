@@ -71,10 +71,12 @@ def main() -> None:
     parser.add_argument("--config", default="config/default.yaml")
     parser.add_argument("--output", default=None, help="결과 JSONL 출력 경로 (미지정 시 stdout)")
     parser.add_argument("--top-k-context", type=int, default=3, help="컨텍스트에 포함할 topk 문서 수")
+    parser.add_argument("--max-retries", type=int, default=10, help="429 등 오류 시 재시도 횟수 (기본 10)")
+    parser.add_argument("--max-wait", type=int, default=60, help="재시도 최대 대기 시간 초 (기본 60)")
     args = parser.parse_args()
 
     try:
-        from ragas import evaluate
+        from ragas import evaluate, RunConfig
         from ragas.metrics import answer_relevancy, context_recall, faithfulness
     except ImportError as e:
         raise SystemExit(
@@ -124,10 +126,17 @@ def main() -> None:
     else:
         print("평가 LLM: OpenAI (기본값)")
 
-    print(f"평가 중 … ({len(dataset)}건)")
+    # 429 TooManyRequests 대응: RunConfig로 재시도 횟수·대기 시간 설정
+    run_config = RunConfig(
+        max_retries=args.max_retries,
+        max_wait=args.max_wait,
+        timeout=120,
+    )
+    print(f"평가 중 … ({len(dataset)}건)  [재시도 최대 {args.max_retries}회, 대기 최대 {args.max_wait}초]")
     result = evaluate(
         dataset=dataset,
         metrics=[faithfulness, answer_relevancy, context_recall],
+        run_config=run_config,
         **eval_kwargs,
     )
 

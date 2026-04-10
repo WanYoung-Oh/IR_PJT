@@ -33,7 +33,7 @@ from ir_rag.generator import format_context, generate_chitchat, generate_with_se
 from ir_rag.io_util import iter_jsonl, write_jsonl
 from ir_rag.query_rewrite import build_search_query, is_science_question
 from ir_rag.reranker import load_reranker, rerank_with_crossencoder, soft_voting_rerank
-from ir_rag.retrieval import es_bm25_doc_ids, rrf_score
+from ir_rag.retrieval import es_bm25_doc_ids, generate_hyde_doc, qdrant_dense_doc_ids, rrf_score
 from ir_rag.submission import SubmissionRecord, validate_submission_row
 from ir_rag.vram import unload_model
 
@@ -48,8 +48,9 @@ def run_pipeline(
 ) -> list[dict]:
     """전체 RAG 파이프라인을 실행하여 제출 행 목록을 반환한다.
 
-    24GB VRAM 제약으로 인해 3-Phase 순차 로드 방식으로 동작한다:
-      Phase 1. 임베딩 모델 로드 → 전체 쿼리 검색(BM25+Dense RRF) → 언로드
+    24GB VRAM 제약으로 인해 4-Phase 순차 로드 방식으로 동작한다:
+      Phase 0. LLM 로드 → 쿼리 재작성 + HyDE doc/alt_query 생성 → 언로드
+      Phase 1. 임베딩 모델 로드 → BM25+Dense 3축 RRF(k=20) → 언로드
       Phase 2. Reranker 로드 → 전체 리랭킹 → 언로드
       Phase 3. LLM 로드 → 전체 답변 생성 → 언로드
     """
@@ -81,6 +82,7 @@ def run_pipeline(
                 "msg": msg,
                 "standalone": msg[-1]["content"],
                 "is_science": True,
+                "hyde_doc": "", "alt_query": "",   # skip_rewrite 시 HyDE 없이 1축 동작
             })
     else:
         print("=== Phase 0: Query Rewriting ===")
@@ -92,8 +94,24 @@ def run_pipeline(
             msg = sample["msg"]
             science = is_science_question(msg, llm)
             standalone = build_search_query(msg, llm=llm) if science else msg[-1]["content"]
+
+            # HyDE doc + alt_query: 과학 질문만 생성 (Phase 1에서 3축 RRF에 활용)
+            if science:
+                hyde_doc = generate_hyde_doc(standalone, llm)
+                import re as _re
+                alt_raw = llm.complete(
+                    f"다음 과학 질문을 다른 표현으로 재작성하세요 (1개만).\n"
+                    f"질문: {standalone}\n재작성:"
+                ).text
+                alt_query = _re.sub(r"<think>.*?</think>", "", alt_raw, flags=_re.DOTALL).strip().split("\n")[0].strip()
+            else:
+                hyde_doc = ""
+                alt_query = ""
+
             standalone_queries.append({
-                "eid": eid, "msg": msg, "standalone": standalone, "is_science": science,
+                "eid": eid, "msg": msg, "standalone": standalone,
+                "is_science": science,
+                "hyde_doc": hyde_doc, "alt_query": alt_query,
             })
             tag = "과학" if science else "치챗"
             print(f"  [{eid}][{tag}] {standalone[:60]}")
@@ -101,10 +119,34 @@ def run_pipeline(
         llm = unload_model(llm)
         print("LLM 언로드 완료\n")
 
+    # ── Phase 0 결과 중간 저장 ────────────────────────────────────────────────
+    import csv
+    phase0_out = root / "artifacts" / "phase0_queries.csv"
+    phase0_out.parent.mkdir(parents=True, exist_ok=True)
+    with phase0_out.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["eval_id", "is_science", "standalone", "hyde_doc", "alt_query"])
+        writer.writeheader()
+        for sq in standalone_queries:
+            writer.writerow({
+                "eval_id":    sq["eid"],
+                "is_science": sq["is_science"],
+                "standalone": sq["standalone"],
+                "hyde_doc":   sq.get("hyde_doc", ""),
+                "alt_query":  sq.get("alt_query", ""),
+            })
+    print(f"Phase 0 중간 저장 완료 → {phase0_out} ({len(standalone_queries)}건)\n")
+
     # ── Phase 1: 임베딩 모델로 전체 검색 ────────────────────────────────────
     print("=== Phase 1: Hybrid Retrieval ===")
     print("임베딩 모델 로드 중 …")
     embed_model = build_huggingface_embedding(cfg["embedding"])
+
+    def _hybrid_search(query: str) -> list[str]:
+        """BM25 + Dense → RRF(k=20) 결과 docid 목록."""
+        vec = embed_model.get_query_embedding(query)
+        bm25_ids = es_bm25_doc_ids(es, es_index, query, top_k_retrieve)
+        dense_ids = qdrant_dense_doc_ids(qdrant, qdrant_coll, lambda _: vec, query, top_k_retrieve)
+        return list(rrf_score([bm25_ids, dense_ids]).keys())
 
     retrieval_results: list[dict] = []
     for sq in standalone_queries:
@@ -116,16 +158,26 @@ def run_pipeline(
             })
             print(f"  [{eid}] 치챗 — 검색 건너뜀")
             continue
-        vec = embed_model.get_query_embedding(standalone)
-        bm25_ids = es_bm25_doc_ids(es, es_index, standalone, top_k_retrieve)
-        dense_ids = qdrant_dense_doc_ids(qdrant, qdrant_coll, lambda _: vec, standalone, top_k_retrieve)
-        rrf = rrf_score([bm25_ids, dense_ids])
+
+        original_ids = _hybrid_search(standalone)
+
+        hyde_doc = sq.get("hyde_doc", "")
+        alt_query = sq.get("alt_query", "")
+        if hyde_doc and alt_query:
+            hyde_ids = _hybrid_search(hyde_doc)
+            alt_ids  = _hybrid_search(alt_query)
+            rrf = rrf_score([original_ids, hyde_ids, alt_ids])
+            axis = "3축(HyDE)"
+        else:
+            rrf = rrf_score([original_ids])
+            axis = "1축(원본)"
+
         candidate_ids = list(rrf.keys())[:top_k_retrieve]
         retrieval_results.append({
             "eid": eid, "msg": msg, "standalone": standalone,
             "rrf": rrf, "candidate_ids": candidate_ids, "is_science": True,
         })
-        print(f"  [{eid}] 검색 완료 — 후보 {len(candidate_ids)}개")
+        print(f"  [{eid}] 검색 완료 — {axis} 후보 {len(candidate_ids)}개")
 
     embed_model = unload_model(embed_model)
     print("임베딩 모델 언로드 완료\n")

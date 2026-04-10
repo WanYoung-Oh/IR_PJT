@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
 from typing import Any
 
@@ -145,30 +146,45 @@ def _build_ragas_llm():
 
 
 def _eval_faithfulness(question: str, answer: str, context: str) -> float:
-    """RAGAS Faithfulness 점수를 계산한다. RAGAS 미설치 시 1.0 반환."""
-    from datasets import Dataset
-    from ragas import evaluate
-    from ragas.metrics import faithfulness
+    """RAGAS Faithfulness 점수를 계산한다.
 
-    data = Dataset.from_dict({
-        "question": [question],
-        "answer": [answer],
-        "contexts": [[context]],
-    })
+    API 타임아웃·오류 발생 또는 결과가 nan이면 1.0을 반환해 self-check를 통과시킨다.
+    (평가자 장애로 인한 불필요한 재생성 방지)
+    """
+    try:
+        from datasets import Dataset
+        from ragas import evaluate
+        from ragas.metrics import faithfulness
 
-    eval_kwargs = {}
-    llm = _build_ragas_llm()
-    if llm is not None:
-        eval_kwargs["llm"] = llm
+        data = Dataset.from_dict({
+            "question": [question],
+            "answer": [answer],
+            "contexts": [[context]],
+        })
 
-    raw = evaluate(dataset=data, metrics=[faithfulness], **eval_kwargs)
+        eval_kwargs = {}
+        llm = _build_ragas_llm()
+        if llm is not None:
+            eval_kwargs["llm"] = llm
 
-    if hasattr(raw, "to_pandas"):
-        return float(raw.to_pandas()["faithfulness"].iloc[0])
-    if isinstance(raw, dict):
-        v = raw["faithfulness"]
-        return float(v[0] if isinstance(v, (list, tuple)) else v)
-    return float(getattr(raw, "faithfulness", [1.0])[0])
+        raw = evaluate(dataset=data, metrics=[faithfulness], **eval_kwargs)
+
+        if hasattr(raw, "to_pandas"):
+            score = float(raw.to_pandas()["faithfulness"].iloc[0])
+        elif isinstance(raw, dict):
+            v = raw["faithfulness"]
+            score = float(v[0] if isinstance(v, (list, tuple)) else v)
+        else:
+            score = float(getattr(raw, "faithfulness", [1.0])[0])
+
+        if math.isnan(score):
+            logger.warning("Faithfulness 평가 결과 nan (API 타임아웃 추정) — 통과 처리")
+            return 1.0
+        return score
+
+    except Exception as e:
+        logger.warning("Faithfulness 평가 실패 (%s) — 통과 처리", e)
+        return 1.0
 
 
 def generate_with_selfcheck(

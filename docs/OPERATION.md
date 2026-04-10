@@ -21,15 +21,16 @@ flowchart TD
     end
 
     subgraph query ["② 쿼리 전처리 (Phase 0)"]
-        CLASS["치챗/과학 분류<br>is_science_question()"]
-        QP["과학: 멀티 턴 LLM 재작성<br>build_search_query()<br>치챗: 원본 질문 그대로"]
+        CLASS["치챗/과학 분류<br>① 규칙 pre-filter → ② LLM<br>is_science_question()"]
+        QP["과학: 멀티 턴 LLM 재작성<br>+ HyDE doc · alt_query 생성<br>치챗: 원본 질문 그대로"]
+        P0SAVE["중간 저장<br>artifacts/phase0_queries.csv"]
     end
 
     subgraph retrieval ["③ 하이브리드 검색 (Phase 1) — 과학만"]
         BM25["BM25 검색<br>es_bm25_doc_ids()"]
         DENSE["Dense 검색<br>qdrant_dense_doc_ids()"]
-        HYDE["HyDE 조건부<br>(BM25 score < threshold)<br>hybrid_search_with_hyde()"]
-        RRF["RRF 병합 k=60<br>rrf_score()<br>→ Top-100"]
+        HYDE["HyDE doc + alt_query<br>(Phase 0에서 생성 · 저장)"]
+        RRF["RRF 병합 k=20<br>3축(원본+HyDE+alt) rrf_score()<br>→ Top-20"]
     end
 
     subgraph rerank ["④ 재순위화 (Phase 2) — 과학만"]
@@ -58,7 +59,7 @@ flowchart TD
 
     D1 --> PRE --> IDX_ES & IDX_QD
     D1 --> DICT --> IDX_ES
-    D2 --> CLASS --> QP
+    D2 --> CLASS --> QP --> P0SAVE
     QP --> BM25 & DENSE & HYDE
     IDX_ES --> BM25
     IDX_QD --> DENSE
@@ -128,13 +129,17 @@ classDiagram
         <<module · Phase 0>>
         +is_science_question(msg, llm) bool
         +build_search_query(msg, llm) str
+        -_SCIENCE_PREFILTER_RE : Pattern
         -_is_valid_query(query, original) bool
+        -_strip_think(text) str
     }
 
     %% ── Phase 1: 색인 / 하이브리드 검색 ──────────────────────────────────────
     class es_util {
         <<module · Phase 1>>
-        +ensure_index(es, index, cfg) None
+        +KOREAN_SYNONYMS : list~str~
+        +ensure_index(es, index, recreate, user_dict_rules) None
+        -_build_settings(user_dict_rules) dict
     }
 
     class embeddings {
@@ -146,11 +151,10 @@ classDiagram
     class retrieval {
         <<module · Phase 1>>
         +es_bm25_doc_ids(es, index, query, top_k) list~str~
-        +qdrant_dense_doc_ids(embed_model, client, query, top_k) list~str~
-        +rrf_score(rankings, k) dict
-        +hybrid_search_with_hyde(query, llm, ...) dict
+        +qdrant_dense_doc_ids(client, collection, embed_fn, query, top_k) list~str~
+        +rrf_score(rankings, k=20) dict
+        +generate_hyde_doc(query, llm) str
         -es_bm25_top_score(es, index, query) float
-        -generate_hyde_doc(query, llm) str
     }
 
     %% ── Phase 2: 재순위화 ─────────────────────────────────────────────────────
@@ -275,6 +279,9 @@ OPENAI_API_KEY=sk-...
 # 둘 다 없거나 Self-check를 완전히 끄려면:
 # DISABLE_SELFCHECK=1
 
+# SFT 데이터 답변 생성용 (build_sft_data.py --answer-api solar)
+SOLAR_API_KEY=up_...
+
 HF_TOKEN=hf_...       # HuggingFace private 모델 접근 시 필요
 ```
 
@@ -379,8 +386,15 @@ ps aux | grep qdrant
 ### 4-1. 희소 검색 (ES BM25 + Nori)
 
 ```bash
+# 최초 색인
 python scripts/index_es.py --config config/default.yaml
+
+# 인덱스 설정 변경 후 재색인 (동의어 사전·분석기 변경 시 --recreate 필수)
+python scripts/index_es.py --config config/default.yaml --recreate
 ```
+
+> `--recreate` 없이 실행하면 기존 인덱스를 그대로 사용합니다(중복 색인 방지).  
+> 분석기·동의어(`KOREAN_SYNONYMS`)·사용자 사전 변경 시 반드시 `--recreate`로 재생성하세요.
 
 ### 4-2. (선택) 사용자 사전 생성 — MeCab 필요
 
@@ -434,10 +448,42 @@ python scripts/run_competition_map.py \
 ### 6-1. 학습 데이터 생성
 
 ```bash
+# 기본: BM25 검색 + placeholder 답변
 python scripts/build_sft_data.py --config config/default.yaml --output artifacts/sft_data.jsonl
+
+# Phase 0 CSV 재활용: 치챗 제외 + standalone 쿼리 재사용 (LLM 재호출 없음)
+# + 상대 점수 필터 70% + 최소 문서 3개 보증 (paraphrase 보충)
+python scripts/build_sft_data.py \
+    --phase0-csv     artifacts/phase0_queries.csv \
+    --min-bm25-score 1.0 \
+    --rel-score-ratio 0.7 \
+    --min-docs       3 \
+    --answer-api     solar --answer-model solar-pro
+    # --answer-api openai                          # GPT-4o-mini
+    # --answer-api google                          # Gemini-2.0-flash
 ```
 
-생성 후 `artifacts/sft_data.jsonl`의 `assistant` 답변을 **고품질 데이터로 교체**하여 학습 효과를 높이세요.
+주요 옵션:
+
+| 옵션 | 기본값 | 설명 |
+|------|--------|------|
+| `--phase0-csv` | 없음 | Phase 0 중간 저장 CSV. 지정 시 치챗 제외·standalone 재활용 |
+| `--min-bm25-score` | 1.0 | BM25 최소 점수. 미달 문서 제외, 전부 미달 시 top-1 유지 |
+| `--rel-score-ratio` | 0.7 | top-1 점수 대비 유지 비율. 미달 문서는 노이즈로 제거. 0이면 비활성화 |
+| `--min-docs` | 3 | 컨텍스트 최소 문서 수. 필터 후 부족하면 paraphrase로 보충 |
+| `--top-k` | 5 | 검색할 최대 문서 수 |
+| `--answer-api` | 없음 | `solar` / `openai` / `google` — 실제 답변 생성 |
+| `--answer-model` | API별 기본값 | 모델 이름 직접 지정 |
+
+> `--answer-api` 없으면 `assistant` 필드에 `[TODO: 고품질 답변으로 교체하세요]` placeholder가 들어갑니다.
+>
+> **문서 품질 관리**: `--rel-score-ratio 0.7`은 top-1 점수의 70% 미만인 문서를 제거합니다.
+> 제거 후 `--min-docs` 미만이면 Solar API로 paraphrase를 생성해 보충합니다.
+> 생성된 답변은 `_clean_answer()`를 통해 LaTeX·마크다운 포맷이 제거된 자연어 텍스트로 정제됩니다.
+>
+> **`phase0_queries.csv` 주의**: 이 파일은 Phase 0 LLM 실행 시 생성됩니다.
+> 치챗 오분류가 의심될 경우 `export_submission.py --pipeline`을 재실행하거나
+> CSV를 직접 수정(`is_science` 컬럼을 `True`로 변경)한 뒤 재생성하세요.
 
 ### 6-2. Unsloth SFT 학습
 
@@ -529,12 +575,12 @@ python scripts/export_submission.py \
 
 **4-Phase 순차 로드 (VRAM 관리)**:
 
-| Phase | 모델         | 작업                                        | 대상   | VRAM  |
-| ----- | ------------ | ------------------------------------------- | ------ | ----- |
-| 0     | LLM 4B       | 치챗/과학 분류 + 멀티턴 쿼리 재작성         | 전체   | ~8GB  |
-| 1     | Embedding 8B | BM25 + Dense → RRF Top-100                  | 과학만 | ~16GB |
-| 2     | Reranker 8B  | Cross-Encoder + Soft Voting → Top-N         | 과학만 | ~16GB |
-| 3     | LLM 4B       | CRAG + Self-check (과학) / 일상 대화 (치챗) | 전체   | ~8GB  |
+| Phase | 모델         | 작업                                                          | 대상   | VRAM  |
+| ----- | ------------ | ------------------------------------------------------------- | ------ | ----- |
+| 0     | LLM 4B       | 치챗/과학 분류(규칙→LLM) + 쿼리 재작성 + HyDE·alt_query 생성 → CSV 저장 | 전체   | ~8GB  |
+| 1     | Embedding 8B | BM25 + Dense → 3축 RRF(k=20) Top-20                          | 과학만 | ~16GB |
+| 2     | Reranker 8B  | Cross-Encoder + Soft Voting → Top-N                          | 과학만 | ~16GB |
+| 3     | LLM 4B       | CRAG + Self-check (과학) / 일상 대화 (치챗)                  | 전체   | ~8GB  |
 
 각 Phase 종료 후 모델을 GPU에서 언로드(`vram.unload_model`)하여 다음 Phase를 위한 VRAM을 확보합니다.
 
@@ -545,10 +591,36 @@ python scripts/export_submission.py \
 > **RAGAS Self-check**: `.env`의 `GOOGLE_API_KEY`(Google AI Studio) 또는 `OPENAI_API_KEY` 중 하나로 LLM 평가자를 구성합니다. `GOOGLE_API_KEY`가 우선 사용됩니다.  
 > 둘 다 없거나 비활성화하려면 `.env`에 `DISABLE_SELFCHECK=1`을 추가하면 첫 번째 생성 결과를 그대로 반환합니다.
 
-### 8-3. 제출 파일 검증
+### 8-3. 제출 파일 후처리
+
+8-2에서 생성된 `sample_submission.csv`의 `answer` 필드를 정제합니다.
+
+| 패턴 | 처리 |
+|------|------|
+| `<think>` 앞에 내용 있음 | 앞 내용만 사용 |
+| `<think>`로 시작 (truncate) | Solar API로 재생성 |
+| CRAG 대시 포맷 (`- 답변:`) | 본문만 추출 |
+| 이미 깨끗함 | 그대로 유지 |
 
 ```bash
-python scripts/validate_submission.py artifacts/sample_submission.csv
+# 미리보기만 (저장 안 함)
+python scripts/postprocess_submission.py \
+    --input artifacts/sample_submission.csv \
+    --dry-run
+
+# 후처리 + Solar API 재생성
+python scripts/postprocess_submission.py \
+    --input  artifacts/sample_submission.csv \
+    --output artifacts/sample_submission_clean.csv \
+    --regen-api solar \
+    --eval   data/eval.jsonl \
+    --docs   data/documents.jsonl
+```
+
+### 8-4. 제출 파일 검증
+
+```bash
+python scripts/validate_submission.py artifacts/sample_submission_clean.csv
 ```
 
 ---
@@ -624,6 +696,51 @@ python -m pytest tests/ --cov=ir_rag --cov-report=term-missing
 대회 제공 스크립트: [baseline_code/rag_with_elasticsearch.py](../baseline_code/rag_with_elasticsearch.py)
 
 Elasticsearch 보안(TLS, 비밀번호) 및 OpenAI API 키는 `.env` 파일로 관리하세요 (`.env.example` 참고).
+
+---
+
+## 색인 이후 재작업 순서 (퀵 레퍼런스)
+
+ES + Qdrant 색인이 완료된 상태에서 결과를 개선하거나 처음부터 재실행할 때의 순서입니다.
+
+```
+[ES + Qdrant 색인 완료] ──────────────────────────────────────────────────────┐
+                                                                               │
+  Step 1. 전체 파이프라인 실행                                                  │
+  python scripts/export_submission.py --pipeline                               │
+      → artifacts/phase0_queries.csv  (Phase 0 분류·재작성 결과)               │
+      → artifacts/sample_submission.csv  (최종 제출 파일 초안)                  │
+                          │                                                    │
+  Step 2. 제출 파일 후처리                                                      │
+  python scripts/postprocess_submission.py                                     │
+      --input  artifacts/sample_submission.csv                                 │
+      --output artifacts/sample_submission_clean.csv                           │
+      --regen-api solar                                                        │
+      → artifacts/sample_submission_clean.csv  (제출용)                        │
+                          │                                                    │
+  Step 3. SFT 학습 데이터 생성                                                  │
+  python scripts/build_sft_data.py                                             │
+      --phase0-csv artifacts/phase0_queries.csv   ← Step 1 결과 재활용         │
+      --rel-score-ratio 0.7 --min-docs 3                                       │
+      --answer-api solar                                                       │
+      → artifacts/sft_data.jsonl                                               │
+                          │                                                    │
+  Step 4. SFT 파인튜닝                                                          │
+  python scripts/train_sft.py                                                  │
+      --data artifacts/sft_data.jsonl                                          │
+      → artifacts/qwen35-4b-science-rag/                                       │
+                          │                                                    │
+  Step 5. 파인튜닝 모델로 재추론 (Step 1 반복)                                   │
+  config/default.yaml 의 llm.model_name 을 파인튜닝 경로로 변경 후             │
+  python scripts/export_submission.py --pipeline                               │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+**주의 사항**
+
+- Step 1 실행 전 ES(`su -s /bin/bash elasticsearch -c ".../elasticsearch -d"`)와 Qdrant(`./qdrant &`)가 기동 중이어야 합니다.
+- `phase0_queries.csv`에 오분류(치챗으로 잘못 분류된 과학 질문)가 있으면 `is_science` 컬럼을 `True`로 수정한 뒤 Step 3부터 재실행하면 됩니다. Step 1 전체 재실행 없이 SFT 데이터만 빠르게 수정할 수 있습니다.
+- Step 2·3은 서로 독립적이므로 병렬 진행 가능합니다.
 
 ---
 
