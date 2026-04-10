@@ -41,8 +41,8 @@ from ir_rag.vram import unload_model
 def run_pipeline(
     cfg: dict,
     root: Path,
-    top_k_retrieve: int = 100,
-    top_k_rerank: int = 20,
+    top_k_retrieve: int = 20,
+    top_k_rerank: int = 10,
     top_k_submit: int = 3,
     skip_rewrite: bool = False,
 ) -> list[dict]:

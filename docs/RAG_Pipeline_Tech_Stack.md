@@ -754,8 +754,15 @@ def is_science_question(msg: list[dict], llm) -> bool:
 
 **Self-check — Faithfulness 기반 재생성**
 
-> **주의**: RAGAS Faithfulness는 내부적으로 **OpenAI API**를 LLM 평가자로 사용합니다.  
-> OpenAI 쿼터 초과 시 `.env`에 `DISABLE_SELFCHECK=1`을 설정하면 첫 번째 생성 결과를 바로 반환합니다.
+> RAGAS Faithfulness 평가자 LLM은 `.env` 키 설정에 따라 자동 선택됩니다.
+>
+> | 조건 | 사용 LLM |
+> |------|----------|
+> | `GOOGLE_API_KEY` 설정 | **Gemini 2.0 Flash** (Google AI Studio, 우선) |
+> | `OPENAI_API_KEY` 설정 | OpenAI 기본값 |
+> | 둘 다 미설정 또는 `DISABLE_SELFCHECK=1` | Self-check 스킵, 첫 번째 생성 결과 반환 |
+>
+> Google AI Studio는 무료 티어(RPM 15, TPM 1,000,000)를 제공합니다.
 
 ```python
 import os
@@ -763,15 +770,26 @@ from ragas.metrics import faithfulness
 from ragas import evaluate
 from datasets import Dataset
 
+def _build_ragas_llm():
+    """GOOGLE_API_KEY 우선, 없으면 None(ragas OpenAI 기본값)."""
+    if os.environ.get("GOOGLE_API_KEY"):
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        from ragas.llms import LangchainLLMWrapper
+        return LangchainLLMWrapper(ChatGoogleGenerativeAI(model="gemini-2.0-flash"))
+    return None
+
 def generate_with_selfcheck(question: str, context: str, llm,
                              threshold: float = 0.7,
                              max_retries: int = 2) -> str:
-    # OpenAI 키 없거나 DISABLE_SELFCHECK=1 이면 단순 생성
-    if not os.environ.get("OPENAI_API_KEY") or os.environ.get("DISABLE_SELFCHECK"):
+    # API 키 없거나 DISABLE_SELFCHECK=1 이면 단순 생성
+    has_api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    if not has_api_key or os.environ.get("DISABLE_SELFCHECK"):
         return generate_answer(question, context, llm)
 
     answer = generate_answer(question, context, llm)
     retries_left = max_retries
+    eval_llm = _build_ragas_llm()
+    eval_kwargs = {"llm": eval_llm} if eval_llm else {}
 
     while True:
         data = Dataset.from_dict({
@@ -780,7 +798,7 @@ def generate_with_selfcheck(question: str, context: str, llm,
             "contexts":  [[context]],
         })
         # RAGAS 0.4.x: 반환 타입이 버전별로 Dataset / Result 혼재 → 스칼라만 안전 추출
-        raw = evaluate(dataset=data, metrics=[faithfulness])
+        raw = evaluate(dataset=data, metrics=[faithfulness], **eval_kwargs)
         if hasattr(raw, "to_pandas"):
             score = float(raw.to_pandas()["faithfulness"].iloc[0])
         elif isinstance(raw, dict):
@@ -812,6 +830,8 @@ def generate_with_selfcheck(question: str, context: str, llm,
 | 항목 | 선택 기술 | 측정 대상 |
 |---|---|---|
 | 통합 평가 | **RAGAS** | Faithfulness, Answer Relevancy, Context Recall |
+| RAGAS 평가 LLM | **Gemini 2.0 Flash** (Google AI Studio, 우선) / OpenAI (대안) | Faithfulness 판정 |
+| RAGAS 임베딩 | **text-embedding-004** (Google) / OpenAI (대안) | Answer Relevancy |
 | 검색 벤치마크 | BEIR | MAP, MRR, NDCG |
 | 실험 추적 | LangSmith | 단계별 레이턴시, 토큰 비용 |
 

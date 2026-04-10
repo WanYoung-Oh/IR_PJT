@@ -8,9 +8,15 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+def _strip_think(text: str) -> str:
+    """Qwen3.5 <think>...</think> 블록을 제거한다."""
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
 # ---------------------------------------------------------------------------
 # 프롬프트 템플릿
@@ -89,7 +95,7 @@ def format_context(
 def generate_chitchat(question: str, llm: Any) -> str:
     """치챗/일상 대화에 대해 검색 없이 자연스러운 응답을 생성한다."""
     prompt = CHITCHAT_PROMPT.format(question=question)
-    return llm.complete(prompt).text.strip()
+    return _strip_think(llm.complete(prompt).text)
 
 
 def generate_answer(
@@ -118,12 +124,25 @@ def generate_answer(
     """
     template = CRAG_PROMPT if use_crag else SCIENCE_QA_PROMPT
     prompt = template.format(context=context, question=question)
-    return llm.complete(prompt).text.strip()
+    return _strip_think(llm.complete(prompt).text)
 
 
 # ---------------------------------------------------------------------------
 # Self-check (RAGAS Faithfulness 기반 재생성)
 # ---------------------------------------------------------------------------
+
+def _build_ragas_llm():
+    """환경변수에 따라 RAGAS용 LLM 래퍼를 반환한다.
+
+    우선순위: GOOGLE_API_KEY > OPENAI_API_KEY (기본값).
+    """
+    import os
+    if os.environ.get("GOOGLE_API_KEY"):
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        from ragas.llms import LangchainLLMWrapper
+        return LangchainLLMWrapper(ChatGoogleGenerativeAI(model="gemini-2.0-flash"))
+    return None  # ragas 기본값(OpenAI) 사용
+
 
 def _eval_faithfulness(question: str, answer: str, context: str) -> float:
     """RAGAS Faithfulness 점수를 계산한다. RAGAS 미설치 시 1.0 반환."""
@@ -136,7 +155,13 @@ def _eval_faithfulness(question: str, answer: str, context: str) -> float:
         "answer": [answer],
         "contexts": [[context]],
     })
-    raw = evaluate(dataset=data, metrics=[faithfulness])
+
+    eval_kwargs = {}
+    llm = _build_ragas_llm()
+    if llm is not None:
+        eval_kwargs["llm"] = llm
+
+    raw = evaluate(dataset=data, metrics=[faithfulness], **eval_kwargs)
 
     if hasattr(raw, "to_pandas"):
         return float(raw.to_pandas()["faithfulness"].iloc[0])
@@ -176,7 +201,8 @@ def generate_with_selfcheck(
         Faithfulness >= threshold 인 답변, 또는 max_retries 소진 후 마지막 답변.
     """
     import os
-    if not os.environ.get("OPENAI_API_KEY") or os.environ.get("DISABLE_SELFCHECK"):
+    has_api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    if not has_api_key or os.environ.get("DISABLE_SELFCHECK"):
         logger.warning("Self-check 비활성화 — 단순 생성")
         return generate_answer(question, context, llm)
 
@@ -208,7 +234,7 @@ def generate_with_selfcheck(
             "반드시 아래 문서 내용만을 근거로 답하세요.\n\n"
             + SCIENCE_QA_PROMPT.format(context=context, question=question)
         )
-        answer = llm.complete(retry_prompt).text.strip()
+        answer = _strip_think(llm.complete(retry_prompt).text)
         retries_left -= 1
 
     return answer
