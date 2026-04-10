@@ -135,9 +135,17 @@ def generate_answer(
 def _build_ragas_llm():
     """환경변수에 따라 RAGAS용 LLM 래퍼를 반환한다.
 
-    우선순위: GOOGLE_API_KEY > OPENAI_API_KEY (기본값).
+    우선순위: SOLAR_API_KEY > GOOGLE_API_KEY > OPENAI_API_KEY (기본값).
     """
     import os
+    if os.environ.get("SOLAR_API_KEY"):
+        from langchain_openai import ChatOpenAI
+        from ragas.llms import LangchainLLMWrapper
+        return LangchainLLMWrapper(ChatOpenAI(
+            model="solar-pro",
+            api_key=os.environ["SOLAR_API_KEY"],
+            base_url="https://api.upstage.ai/v1",
+        ))
     if os.environ.get("GOOGLE_API_KEY"):
         from langchain_google_genai import ChatGoogleGenerativeAI
         from ragas.llms import LangchainLLMWrapper
@@ -217,7 +225,11 @@ def generate_with_selfcheck(
         Faithfulness >= threshold 인 답변, 또는 max_retries 소진 후 마지막 답변.
     """
     import os
-    has_api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    has_api_key = (
+        os.environ.get("SOLAR_API_KEY")
+        or os.environ.get("GOOGLE_API_KEY")
+        or os.environ.get("OPENAI_API_KEY")
+    )
     if not has_api_key or os.environ.get("DISABLE_SELFCHECK"):
         logger.warning("Self-check 비활성화 — 단순 생성")
         return generate_answer(question, context, llm)
