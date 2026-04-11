@@ -135,17 +135,10 @@ def generate_answer(
 def _build_ragas_llm():
     """환경변수에 따라 RAGAS용 LLM 래퍼를 반환한다.
 
-    우선순위: SOLAR_API_KEY > GOOGLE_API_KEY > OPENAI_API_KEY (기본값).
+    우선순위: GOOGLE_API_KEY > OPENAI_API_KEY (기본값).
+    Solar API는 이 서버 환경에서 타임아웃이 잦아 RAGAS 평가자로 사용하지 않는다.
     """
     import os
-    if os.environ.get("SOLAR_API_KEY"):
-        from langchain_openai import ChatOpenAI
-        from ragas.llms import LangchainLLMWrapper
-        return LangchainLLMWrapper(ChatOpenAI(
-            model="solar-pro",
-            api_key=os.environ["SOLAR_API_KEY"],
-            base_url="https://api.upstage.ai/v1",
-        ))
     if os.environ.get("GOOGLE_API_KEY"):
         from langchain_google_genai import ChatGoogleGenerativeAI
         from ragas.llms import LangchainLLMWrapper
@@ -170,12 +163,16 @@ def _eval_faithfulness(question: str, answer: str, context: str) -> float:
             "contexts": [[context]],
         })
 
+        from ragas import RunConfig
+
         eval_kwargs = {}
         llm = _build_ragas_llm()
         if llm is not None:
             eval_kwargs["llm"] = llm
 
-        raw = evaluate(dataset=data, metrics=[faithfulness], **eval_kwargs)
+        run_config = RunConfig(max_retries=3, max_wait=30, timeout=60)
+        raw = evaluate(dataset=data, metrics=[faithfulness],
+                       run_config=run_config, **eval_kwargs)
 
         if hasattr(raw, "to_pandas"):
             score = float(raw.to_pandas()["faithfulness"].iloc[0])

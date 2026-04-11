@@ -12,6 +12,21 @@ class _LLMComplete(Protocol):
 
 
 # ---------------------------------------------------------------------------
+# 규칙 기반 치챗 pre-filter (과학 pre-filter보다 먼저 실행)
+# AI 자신에 대한 질문·감정·인사 등 명백한 치챗은 LLM 호출 없이 False 반환.
+# ---------------------------------------------------------------------------
+_CHITCHAT_PREFILTER_RE = re.compile(
+    r"(?:"
+    r"^너[는은]?\s*(누구|뭐|무엇|어떤|잘하|못하|좋아|싫어|할\s*수|어디)|"  # 너는 누구야, 너 잘하는게
+    r"^당신[은는]?\s*(누구|뭐|무엇|어떤)|"
+    r"^(안녕|반가워|반갑습|ㅎㅇ|ㅋㅋ|ㄴㄴ|ㅇㅇ|ㅠㅠ|ㅜㅜ)\b|"
+    r"기분\s*(좋|나쁘|최고|별로|그냥)|"
+    r"오늘\s*(뭐\s*먹|심심|힘들|피곤|좋)"
+    r")",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# ---------------------------------------------------------------------------
 # 규칙 기반 과학 질문 pre-filter
 # 해당 패턴이 마지막 사용자 메시지에 있으면 LLM 호출 없이 is_science=True 반환.
 # 4B 모델이 구어체·생활 접목 과학 질문을 치챗으로 오판하는 문제를 보완한다.
@@ -98,7 +113,12 @@ def is_science_question(msg: list[dict], llm: _LLMComplete) -> bool:
     last = next((m["content"] for m in reversed(msg) if m["role"] == "user"), "")
     user_msgs = [m for m in msg if m["role"] == "user"]
 
-    # ── Step 1: 규칙 기반 pre-filter ───────────────────────────────────────
+    # ── Step 0: 치챗 pre-filter (과학 pre-filter보다 우선) ─────────────────
+    if _CHITCHAT_PREFILTER_RE.search(last):
+        logger.debug("치챗 pre-filter 적중 (LLM 호출 생략): '%s'", last)
+        return False
+
+    # ── Step 1: 규칙 기반 과학 pre-filter ──────────────────────────────────
     if _SCIENCE_PREFILTER_RE.search(last):
         logger.debug("과학 질문 pre-filter 통과 (LLM 호출 생략): '%s'", last)
         return True
