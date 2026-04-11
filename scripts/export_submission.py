@@ -45,6 +45,7 @@ def run_pipeline(
     top_k_rerank: int = 10,
     top_k_submit: int = 3,
     skip_rewrite: bool = False,
+    phase0_cache: Path | None = None,
 ) -> list[dict]:
     """전체 RAG 파이프라인을 실행하여 제출 행 목록을 반환한다.
 
@@ -73,7 +74,26 @@ def run_pipeline(
 
     # ── Phase 0: LLM으로 쿼리 재작성 (멀티턴만) ─────────────────────────────
     standalone_queries: list[dict] = []
-    if skip_rewrite:
+    if phase0_cache is not None:
+        print(f"=== Phase 0: 건너뜀 (캐시 파일 사용: {phase0_cache}) ===")
+        import csv as _csv
+        # eval_id → msg 매핑 (msg는 CSV에 없으므로 eval.jsonl에서 로드)
+        msg_map: dict[int, list] = {int(s["eval_id"]): s["msg"] for s in samples}
+        with open(phase0_cache, newline="", encoding="utf-8") as f:
+            reader = _csv.DictReader(f)
+            for row in reader:
+                eid = int(row["eval_id"])
+                is_science = row["is_science"].strip().lower() in ("true", "1", "yes")
+                standalone_queries.append({
+                    "eid": eid,
+                    "msg": msg_map[eid],
+                    "standalone": row["standalone"],
+                    "is_science": is_science,
+                    "hyde_doc": row.get("hyde_doc", ""),
+                    "alt_query": row.get("alt_query", ""),
+                })
+        print(f"  캐시 로드 완료 ({len(standalone_queries)}건)\n")
+    elif skip_rewrite:
         print("=== Phase 0: 건너뜀 (--skip-rewrite) ===")
         for sample in samples:
             msg = sample["msg"]
@@ -119,22 +139,25 @@ def run_pipeline(
         llm = unload_model(llm)
         print("LLM 언로드 완료\n")
 
-    # ── Phase 0 결과 중간 저장 ────────────────────────────────────────────────
+    # ── Phase 0 결과 중간 저장 (캐시 파일 지정 시 건너뜀) ───────────────────
     import csv
     phase0_out = root / "artifacts" / "phase0_queries.csv"
-    phase0_out.parent.mkdir(parents=True, exist_ok=True)
-    with phase0_out.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["eval_id", "is_science", "standalone", "hyde_doc", "alt_query"])
-        writer.writeheader()
-        for sq in standalone_queries:
-            writer.writerow({
-                "eval_id":    sq["eid"],
-                "is_science": sq["is_science"],
-                "standalone": sq["standalone"],
-                "hyde_doc":   sq.get("hyde_doc", ""),
-                "alt_query":  sq.get("alt_query", ""),
-            })
-    print(f"Phase 0 중간 저장 완료 → {phase0_out} ({len(standalone_queries)}건)\n")
+    if phase0_cache is not None:
+        print(f"Phase 0 중간 저장 건너뜀 (캐시 파일 사용 중)\n")
+    else:
+        phase0_out.parent.mkdir(parents=True, exist_ok=True)
+        with phase0_out.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["eval_id", "is_science", "standalone", "hyde_doc", "alt_query"])
+            writer.writeheader()
+            for sq in standalone_queries:
+                writer.writerow({
+                    "eval_id":    sq["eid"],
+                    "is_science": sq["is_science"],
+                    "standalone": sq["standalone"],
+                    "hyde_doc":   sq.get("hyde_doc", ""),
+                    "alt_query":  sq.get("alt_query", ""),
+                })
+        print(f"Phase 0 중간 저장 완료 → {phase0_out} ({len(standalone_queries)}건)\n")
 
     # ── Phase 1: 임베딩 모델로 전체 검색 ────────────────────────────────────
     print("=== Phase 1: Hybrid Retrieval ===")
@@ -286,6 +309,8 @@ def main() -> None:
     parser.add_argument("--top-k-rerank", type=int, default=20)
     parser.add_argument("--skip-rewrite", action="store_true",
                         help="Phase 0 건너뜀 — 원본 쿼리로 Phase 1~3만 점검")
+    parser.add_argument("--phase0-cache", metavar="CSV",
+                        help="Phase 0 캐시 CSV 경로 지정 시 Phase 0을 건너뛰고 해당 파일로 Phase 1~3 실행")
     args = parser.parse_args()
 
     if not args.placeholder and not args.pipeline:
@@ -299,13 +324,18 @@ def main() -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
 
     if args.pipeline:
-        print("실제 파이프라인 모드 실행 중 …")
+        phase0_cache_path = Path(args.phase0_cache) if args.phase0_cache else None
+        if phase0_cache_path is not None:
+            print(f"실제 파이프라인 모드 실행 중 … (Phase 0 캐시: {phase0_cache_path})")
+        else:
+            print("실제 파이프라인 모드 실행 중 …")
         rows_out = run_pipeline(
             cfg, root,
             top_k_retrieve=args.top_k_retrieve,
             top_k_rerank=args.top_k_rerank,
             top_k_submit=top_k,
             skip_rewrite=args.skip_rewrite,
+            phase0_cache=phase0_cache_path,
         )
     else:
         rows_out = []

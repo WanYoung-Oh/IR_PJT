@@ -465,15 +465,15 @@ python scripts/build_sft_data.py \
 
 주요 옵션:
 
-| 옵션 | 기본값 | 설명 |
-|------|--------|------|
-| `--phase0-csv` | 없음 | Phase 0 중간 저장 CSV. 지정 시 치챗 제외·standalone 재활용 |
-| `--min-bm25-score` | 1.0 | BM25 최소 점수. 미달 문서 제외, 전부 미달 시 top-1 유지 |
-| `--rel-score-ratio` | 0.7 | top-1 점수 대비 유지 비율. 미달 문서는 노이즈로 제거. 0이면 비활성화 |
-| `--min-docs` | 3 | 컨텍스트 최소 문서 수. 필터 후 부족하면 paraphrase로 보충 |
-| `--top-k` | 5 | 검색할 최대 문서 수 |
-| `--answer-api` | 없음 | `solar` / `openai` / `google` — 실제 답변 생성 |
-| `--answer-model` | API별 기본값 | 모델 이름 직접 지정 |
+| 옵션                | 기본값       | 설명                                                                 |
+| ------------------- | ------------ | -------------------------------------------------------------------- |
+| `--phase0-csv`      | 없음         | Phase 0 중간 저장 CSV. 지정 시 치챗 제외·standalone 재활용           |
+| `--min-bm25-score`  | 1.0          | BM25 최소 점수. 미달 문서 제외, 전부 미달 시 top-1 유지              |
+| `--rel-score-ratio` | 0.7          | top-1 점수 대비 유지 비율. 미달 문서는 노이즈로 제거. 0이면 비활성화 |
+| `--min-docs`        | 3            | 컨텍스트 최소 문서 수. 필터 후 부족하면 paraphrase로 보충            |
+| `--top-k`           | 5            | 검색할 최대 문서 수                                                  |
+| `--answer-api`      | 없음         | `solar` / `openai` / `google` — 실제 답변 생성                       |
+| `--answer-model`    | API별 기본값 | 모델 이름 직접 지정                                                  |
 
 > `--answer-api` 없으면 `assistant` 필드에 `[TODO: 고품질 답변으로 교체하세요]` placeholder가 들어갑니다.
 >
@@ -575,12 +575,12 @@ python scripts/export_submission.py \
 
 **4-Phase 순차 로드 (VRAM 관리)**:
 
-| Phase | 모델         | 작업                                                          | 대상   | VRAM  |
-| ----- | ------------ | ------------------------------------------------------------- | ------ | ----- |
+| Phase | 모델         | 작업                                                                    | 대상   | VRAM  |
+| ----- | ------------ | ----------------------------------------------------------------------- | ------ | ----- |
 | 0     | LLM 4B       | 치챗/과학 분류(규칙→LLM) + 쿼리 재작성 + HyDE·alt_query 생성 → CSV 저장 | 전체   | ~8GB  |
-| 1     | Embedding 8B | BM25 + Dense → 3축 RRF(k=20) Top-20                          | 과학만 | ~16GB |
-| 2     | Reranker 8B  | Cross-Encoder + Soft Voting → Top-N                          | 과학만 | ~16GB |
-| 3     | LLM 4B       | CRAG + Self-check (과학) / 일상 대화 (치챗)                  | 전체   | ~8GB  |
+| 1     | Embedding 8B | BM25 + Dense → 3축 RRF(k=20) Top-20                                     | 과학만 | ~16GB |
+| 2     | Reranker 8B  | Cross-Encoder + Soft Voting → Top-N                                     | 과학만 | ~16GB |
+| 3     | LLM 4B       | CRAG + Self-check (과학) / 일상 대화 (치챗)                             | 전체   | ~8GB  |
 
 각 Phase 종료 후 모델을 GPU에서 언로드(`vram.unload_model`)하여 다음 Phase를 위한 VRAM을 확보합니다.
 
@@ -588,19 +588,19 @@ python scripts/export_submission.py \
 > Phase 0에서 `is_science_question()`으로 분류 후, 치챗 샘플은 Phase 1·2 검색·리랭킹을 건너뛰고  
 > Phase 3에서 `generate_chitchat()`으로 자연스러운 대화 응답을 생성합니다.
 
-> **RAGAS Self-check**: `.env`의 `GOOGLE_API_KEY`(Google AI Studio) 또는 `OPENAI_API_KEY` 중 하나로 LLM 평가자를 구성합니다. `GOOGLE_API_KEY`가 우선 사용됩니다.  
+> **RAGAS Self-check**: `.env`의 `SOLAR_API_KEY`, `GOOGLE_API_KEY`(Google AI Studio) 또는 `OPENAI_API_KEY` 중 하나로 LLM 평가자를 구성합니다. `SOLAR_API_KEY`가 우선 사용됩니다.  
 > 둘 다 없거나 비활성화하려면 `.env`에 `DISABLE_SELFCHECK=1`을 추가하면 첫 번째 생성 결과를 그대로 반환합니다.
 
 ### 8-3. 제출 파일 후처리
 
 8-2에서 생성된 `sample_submission.csv`의 `answer` 필드를 정제합니다.
 
-| 패턴 | 처리 |
-|------|------|
-| `<think>` 앞에 내용 있음 | 앞 내용만 사용 |
+| 패턴                        | 처리               |
+| --------------------------- | ------------------ |
+| `<think>` 앞에 내용 있음    | 앞 내용만 사용     |
 | `<think>`로 시작 (truncate) | Solar API로 재생성 |
-| CRAG 대시 포맷 (`- 답변:`) | 본문만 추출 |
-| 이미 깨끗함 | 그대로 유지 |
+| CRAG 대시 포맷 (`- 답변:`)  | 본문만 추출        |
+| 이미 깨끗함                 | 그대로 유지        |
 
 ```bash
 # 미리보기만 (저장 안 함)
@@ -639,11 +639,11 @@ python scripts/ragas_eval.py \
 
 평가 LLM은 `.env`의 키 설정에 따라 자동 선택됩니다:
 
-| 조건 | 사용 LLM | 비고 |
-|------|----------|------|
+| 조건                  | 사용 LLM                                | 비고                 |
+| --------------------- | --------------------------------------- | -------------------- |
 | `GOOGLE_API_KEY` 설정 | **Gemini 2.0 Flash** (Google AI Studio) | 무료 티어, 우선 사용 |
-| `OPENAI_API_KEY` 설정 | OpenAI 기본값 | Google 키 없을 때 |
-| 둘 다 미설정 | 오류 발생 | 둘 중 하나 필수 |
+| `OPENAI_API_KEY` 설정 | OpenAI 기본값                           | Google 키 없을 때    |
+| 둘 다 미설정          | 오류 발생                               | 둘 중 하나 필수      |
 
 ```bash
 # LangSmith 추적 활성화
