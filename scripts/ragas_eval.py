@@ -110,9 +110,18 @@ def main() -> None:
     if os.getenv("LANGCHAIN_API_KEY") and os.getenv("LANGCHAIN_TRACING_V2") == "true":
         print("LangSmith 추적 활성화")
 
-    # RAGAS 평가용 LLM/Embeddings — GOOGLE_API_KEY 우선, 없으면 OpenAI 기본값
+    # RAGAS 평가용 LLM/Embeddings — SOLAR_API_KEY 우선, 없으면 GOOGLE, 없으면 OpenAI 기본값
     eval_kwargs: dict = {}
-    if os.getenv("GOOGLE_API_KEY"):
+    if os.getenv("SOLAR_API_KEY"):
+        from langchain_openai import ChatOpenAI
+        from ragas.llms import LangchainLLMWrapper
+        eval_kwargs["llm"] = LangchainLLMWrapper(ChatOpenAI(
+            model="solar-pro",
+            api_key=os.getenv("SOLAR_API_KEY"),
+            base_url="https://api.upstage.ai/v1",
+        ))
+        print("평가 LLM: Solar (solar-pro)")
+    elif os.getenv("GOOGLE_API_KEY"):
         from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
         from ragas.embeddings import LangchainEmbeddingsWrapper
         from ragas.llms import LangchainLLMWrapper
