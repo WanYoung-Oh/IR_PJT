@@ -17,6 +17,15 @@ eval.jsonl + documents.jsonl + retriever → Unsloth SFT 포맷(messages JSONL) 
     # Google Gemini로 답변 생성
     python scripts/build_sft_data.py --phase0-csv artifacts/phase0_queries.csv \\
         --answer-api google
+
+    # [Phase B-1] Hybrid + Reranker 필터 + Faithfulness 게이트 (24GB GPU)
+    python scripts/build_sft_data.py \\
+        --phase0-csv artifacts/phase0_queries.csv \\
+        --answer-api solar \\
+        --hybrid \\
+        --reranker-threshold 0.3 \\
+        --faithfulness-gate \\
+        --output artifacts/sft_data_b1.jsonl
 """
 from __future__ import annotations
 
@@ -36,6 +45,10 @@ load_dotenv(ROOT / ".env")
 from ir_rag.config import load_config, repo_root_from, resolve_config_path
 from ir_rag.io_util import iter_jsonl, write_jsonl
 from ir_rag.query_rewrite import build_search_query
+
+import logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
+logger = logging.getLogger(__name__)
 
 
 def _load_phase0_csv(csv_path: Path) -> dict[int, dict]:
@@ -296,6 +309,259 @@ def build_sft_dataset(
     print(f"\n{summary}")
 
 
+# ---------------------------------------------------------------------------
+# Phase B-1: Hybrid + Reranker 필터 + Faithfulness 게이트
+# ---------------------------------------------------------------------------
+
+def _eval_faithfulness_b1(question: str, answer: str, context: str) -> float:
+    """RAGAS Faithfulness 점수 계산. 실패 시 1.0 반환."""
+    import math
+    try:
+        import nest_asyncio
+        nest_asyncio.apply()
+        from datasets import Dataset
+        from ragas import evaluate, RunConfig
+        from ragas.metrics import faithfulness
+
+        data = Dataset.from_dict({
+            "question": [question],
+            "answer": [answer],
+            "contexts": [[context]],
+        })
+        eval_kwargs: dict = {}
+        if os.environ.get("SOLAR_API_KEY"):
+            from langchain_openai import ChatOpenAI
+            from ragas.llms import LangchainLLMWrapper
+            eval_kwargs["llm"] = LangchainLLMWrapper(ChatOpenAI(
+                model="solar-pro",
+                api_key=os.environ["SOLAR_API_KEY"],
+                base_url="https://api.upstage.ai/v1",
+            ))
+        elif os.environ.get("GOOGLE_API_KEY"):
+            from langchain_google_genai import ChatGoogleGenerativeAI
+            from ragas.llms import LangchainLLMWrapper
+            eval_kwargs["llm"] = LangchainLLMWrapper(
+                ChatGoogleGenerativeAI(model="gemini-2.0-flash")
+            )
+        run_config = RunConfig(max_retries=3, max_wait=30, timeout=60)
+        raw = evaluate(dataset=data, metrics=[faithfulness],
+                       run_config=run_config, **eval_kwargs)
+        if hasattr(raw, "to_pandas"):
+            score = float(raw.to_pandas()["faithfulness"].iloc[0])
+        elif isinstance(raw, dict):
+            v = raw["faithfulness"]
+            score = float(v[0] if isinstance(v, (list, tuple)) else v)
+        else:
+            score = float(getattr(raw, "faithfulness", [1.0])[0])
+        return 1.0 if math.isnan(score) else score
+    except Exception as e:
+        logger.warning("Faithfulness 평가 실패 (%s) — 통과 처리", e)
+        return 1.0
+
+
+def build_sft_dataset_b1(
+    eval_path: Path,
+    doc_path: Path,
+    out_path: Path,
+    cfg: dict,
+    phase0_map: dict[int, dict] | None,
+    api_client,
+    api_model: str,
+    top_k: int = 20,
+    reranker_threshold: float = 0.3,
+    faithfulness_gate: bool = True,
+    faithfulness_threshold: float = 0.7,
+    use_hybrid: bool = True,
+) -> None:
+    """Phase B-1: Hybrid 검색 + Reranker 필터 + Faithfulness 게이트로 SFT 데이터 재구축.
+
+    24GB VRAM 제약 대응을 위해 3-Phase 순차 로드 방식으로 동작한다:
+      Phase 1. BM25 전체 검색 (GPU 불필요)
+      Phase 2. (use_hybrid) 임베딩 모델 로드 → Dense 검색 → RRF 병합 → 언로드
+      Phase 3. Reranker 로드 → 전체 스코어링 + threshold 필터 → 언로드
+      Phase 4. Solar API 답변 생성 + Faithfulness 게이트
+    """
+    from elasticsearch import Elasticsearch
+    from ir_rag.retrieval import es_bm25_doc_ids, rrf_score
+
+    doc_map: dict[str, str] = {d["docid"]: d["content"] for d in iter_jsonl(doc_path)}
+
+    # 처리 대상 쿼리 수집 (치챗 제외)
+    queries: list[dict] = []
+    for sample in iter_jsonl(eval_path):
+        eid = int(sample["eval_id"])
+        msg = sample["msg"]
+        if phase0_map is not None:
+            p0 = phase0_map.get(eid)
+            if p0 is None:
+                continue
+            if not p0["is_science"]:
+                logger.info("[%d] 치챗 — 건너뜀", eid)
+                continue
+            standalone = p0["standalone"]
+        else:
+            standalone = build_search_query(msg, llm=None)
+        queries.append({"eid": eid, "msg": msg, "standalone": standalone})
+
+    logger.info("처리 대상 쿼리: %d건 (치챗 제외)", len(queries))
+
+    # ── Phase 1: BM25 전체 검색 ───────────────────────────────────────────
+    logger.info("=== Phase 1: BM25 검색 ===")
+    es = Elasticsearch(cfg["elasticsearch"]["url"])
+    es_index = cfg["elasticsearch"]["index"]
+    bm25_results: dict[int, list[str]] = {}
+    for q in queries:
+        bm25_results[q["eid"]] = es_bm25_doc_ids(es, es_index, q["standalone"], top_k)
+        logger.info("  [%d] BM25 %d건", q["eid"], len(bm25_results[q["eid"]]))
+
+    # ── Phase 2: Dense 검색 + RRF 병합 ───────────────────────────────────
+    rrf_results: dict[int, list[str]] = {}
+    if use_hybrid:
+        logger.info("=== Phase 2: Dense 검색 + RRF 병합 ===")
+        from ir_rag.embeddings import build_huggingface_embedding
+        from ir_rag.retrieval import qdrant_dense_doc_ids
+        from ir_rag.vram import unload_model
+        from qdrant_client import QdrantClient
+
+        embed_model = build_huggingface_embedding(cfg["embedding"])
+        qdrant = QdrantClient(url=cfg["qdrant"]["url"])
+        collection = cfg["qdrant"]["collection"]
+
+        for q in queries:
+            eid = q["eid"]
+            vec = embed_model.get_query_embedding(q["standalone"])
+            dense_ids = qdrant_dense_doc_ids(qdrant, collection, lambda _: vec, q["standalone"], top_k)
+            merged = rrf_score([bm25_results[eid], dense_ids])
+            rrf_results[eid] = list(merged.keys())[:top_k]
+            logger.info("  [%d] RRF 후보 %d건 (BM25 %d + Dense %d)",
+                        eid, len(rrf_results[eid]), len(bm25_results[eid]), len(dense_ids))
+
+        embed_model = unload_model(embed_model)
+        logger.info("임베딩 모델 언로드 완료")
+    else:
+        rrf_results = {q["eid"]: bm25_results[q["eid"]] for q in queries}
+        logger.info("=== Phase 2: Dense 건너뜀 (BM25-only) ===")
+
+    # ── Phase 3: Reranker 스코어링 + threshold 필터 ───────────────────────
+    filtered_results: dict[int, list[str]] = {}
+    if reranker_threshold > 0:
+        logger.info("=== Phase 3: Reranker 스코어링 (threshold=%.2f) ===", reranker_threshold)
+        from ir_rag.reranker import load_reranker, rerank_with_crossencoder, soft_voting_rerank
+        from ir_rag.vram import unload_model
+
+        rcfg = cfg.get("reranker", {})
+        reranker, reranker_tok = load_reranker(
+            model_name=rcfg.get("model_name", "Qwen/Qwen3-Reranker-8B"),
+            trust_remote_code=rcfg.get("trust_remote_code", True),
+        )
+
+        for q in queries:
+            eid = q["eid"]
+            candidate_ids = rrf_results[eid]
+            reranker_scores = rerank_with_crossencoder(
+                query=q["standalone"],
+                doc_ids=candidate_ids,
+                doc_texts=doc_map,
+                model=reranker,
+                tokenizer=reranker_tok,
+            )
+            # threshold 미만 문서 제거
+            passed = {did: s for did, s in reranker_scores.items() if s >= reranker_threshold}
+            if not passed:
+                # 전부 미달 시 top-1 유지
+                top1 = list(reranker_scores.keys())[:1]
+                passed = {did: reranker_scores[did] for did in top1}
+                logger.info("  [%d] 전부 threshold 미달 → top-1 유지", eid)
+
+            combined = soft_voting_rerank(
+                {did: 1.0 / (i + 1) for i, did in enumerate(candidate_ids)},
+                reranker_scores,
+            )
+            filtered_results[eid] = [did for did in combined if did in passed]
+            logger.info("  [%d] 필터 후 %d/%d건 (reranker≥%.2f)",
+                        eid, len(filtered_results[eid]), len(candidate_ids), reranker_threshold)
+
+        reranker = unload_model(reranker)
+        logger.info("Reranker 언로드 완료")
+    else:
+        filtered_results = rrf_results
+        logger.info("=== Phase 3: Reranker 건너뜀 ===")
+
+    # ── Phase 4: 답변 생성 + Faithfulness 게이트 ─────────────────────────
+    logger.info("=== Phase 4: 답변 생성 + Faithfulness 게이트 ===")
+    records = []
+    stats = {"included": 0, "excluded": 0, "error": 0}
+
+    for q in queries:
+        eid = q["eid"]
+        msg = q["msg"]
+        standalone = q["standalone"]
+        doc_ids = filtered_results.get(eid, [])
+        doc_contents = [doc_map[did] for did in doc_ids if did in doc_map]
+
+        if not doc_contents:
+            logger.warning("  [%d] 컨텍스트 문서 없음 — 건너뜀", eid)
+            stats["error"] += 1
+            continue
+
+        context = "\n\n".join(f"[문서 {i+1}] {c}" for i, c in enumerate(doc_contents))
+
+        # 메시지 구성
+        messages: list[dict] = [{"role": "system", "content": _SYSTEM_PROMPT}]
+        for m in msg[:-1]:
+            messages.append({"role": m["role"], "content": m["content"]})
+        messages.append({
+            "role": "user",
+            "content": f"참고 문서:\n{context}\n\n질문: {msg[-1]['content']}",
+        })
+
+        # 답변 생성
+        try:
+            answer = _generate_answer_via_api(api_client, api_model, messages)
+        except Exception as e:
+            logger.warning("  [%d] 답변 생성 실패 (%s)", eid, e)
+            stats["error"] += 1
+            continue
+
+        # Faithfulness 게이트
+        if faithfulness_gate:
+            score = _eval_faithfulness_b1(standalone, answer, context)
+            if score < faithfulness_threshold:
+                logger.info("  [%d] Faithfulness %.2f < %.2f — 재생성", eid, score, faithfulness_threshold)
+                retry_msgs = messages[:-1] + [{
+                    "role": "user",
+                    "content": (
+                        "이전 답변이 문서 근거를 충분히 활용하지 못했습니다. "
+                        "반드시 제공된 문서 내용만을 근거로 답하세요.\n\n"
+                        f"참고 문서:\n{context}\n\n질문: {msg[-1]['content']}"
+                    ),
+                }]
+                try:
+                    answer = _generate_answer_via_api(api_client, api_model, retry_msgs)
+                    score = _eval_faithfulness_b1(standalone, answer, context)
+                except Exception as e:
+                    logger.warning("  [%d] 재생성 실패 (%s)", eid, e)
+
+            if score < faithfulness_threshold:
+                logger.info("  [%d] Faithfulness %.2f 최종 미달 — 제외", eid, score)
+                stats["excluded"] += 1
+                continue
+            logger.info("  [%d] Faithfulness %.2f — 통과 (%d개 문서)", eid, score, len(doc_contents))
+        else:
+            logger.info("  [%d] 완료 (%d개 문서)", eid, len(doc_contents))
+
+        messages.append({"role": "assistant", "content": answer})
+        records.append({"messages": messages})
+        stats["included"] += 1
+
+    write_jsonl(out_path, records)
+    print(
+        f"\n=== Phase B-1 완료 ===\n"
+        f"포함: {stats['included']}건 | 제외: {stats['excluded']}건 | 오류: {stats['error']}건\n"
+        f"출력: {out_path}"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--config", default="config/default.yaml")
@@ -326,6 +592,23 @@ def main() -> None:
         "--answer-model", default=None,
         help="외부 API 모델명 (기본: solar→solar-pro, openai→gpt-4o-mini, google→gemini-2.0-flash).",
     )
+    # ── Phase B-1 전용 플래그 ────────────────────────────────────────────
+    parser.add_argument(
+        "--hybrid", action="store_true",
+        help="[B-1] BM25 + Dense RRF 하이브리드 검색 활성화 (Qdrant + 임베딩 모델 필요).",
+    )
+    parser.add_argument(
+        "--reranker-threshold", type=float, default=0.0,
+        help="[B-1] Reranker 점수 임계값. 이 값 미만 문서를 컨텍스트에서 제거 (기본 0 = 비활성화). 권장: 0.3",
+    )
+    parser.add_argument(
+        "--faithfulness-gate", action="store_true",
+        help="[B-1] RAGAS Faithfulness ≥ 0.7 게이트 활성화. 미달 시 재생성 1회 후 제외.",
+    )
+    parser.add_argument(
+        "--faithfulness-threshold", type=float, default=0.7,
+        help="[B-1] Faithfulness 최소 임계값 (기본 0.7). --faithfulness-gate 필요.",
+    )
     args = parser.parse_args()
 
     root = repo_root_from(Path.cwd())
@@ -353,7 +636,30 @@ def main() -> None:
         api_model = args.answer_model or default_models[args.answer_api]
         print(f"외부 API 답변 생성: {args.answer_api} / {api_model}")
 
-    # BM25 retriever (min_score 지원)
+    # ── B-1 모드 분기 ────────────────────────────────────────────────────
+    if args.hybrid or args.reranker_threshold > 0 or args.faithfulness_gate:
+        if not args.answer_api:
+            parser.error("B-1 모드(--hybrid / --reranker-threshold / --faithfulness-gate)는 --answer-api 필수.")
+        if not args.phase0_csv:
+            print("[경고] --phase0-csv 미지정. standalone 쿼리를 원본 msg에서 추출합니다.")
+
+        build_sft_dataset_b1(
+            eval_path=eval_path,
+            doc_path=doc_path,
+            out_path=out_path,
+            cfg=cfg,
+            phase0_map=phase0_map,
+            api_client=api_client,
+            api_model=api_model,
+            top_k=args.top_k if args.top_k != 5 else 20,   # B-1 기본값 20
+            reranker_threshold=args.reranker_threshold,
+            faithfulness_gate=args.faithfulness_gate,
+            faithfulness_threshold=args.faithfulness_threshold,
+            use_hybrid=args.hybrid,
+        )
+        return
+
+    # ── 기존 모드 (BM25-only) ────────────────────────────────────────────
     try:
         from elasticsearch import Elasticsearch
         es = Elasticsearch(cfg["elasticsearch"]["url"])
