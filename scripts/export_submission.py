@@ -120,7 +120,10 @@ def run_pipeline(
                 hyde_doc = generate_hyde_doc(standalone, llm)
                 import re as _re
                 alt_raw = llm.complete(
-                    f"다음 과학 질문을 다른 표현으로 재작성하세요 (1개만).\n"
+                    f"다음 과학 질문을 동의어·유사어를 활용해 다른 표현으로 재작성하세요 (1개만).\n"
+                    f"예시: '세제 거품 원리' → '비누 계면활성제 기포 생성 원리'\n"
+                    f"예시: '광합성 명반응' → '엽록체 빛 에너지 ATP 합성 반응'\n"
+                    f"핵심 용어의 동의어·상위어·하위어를 포함해 검색 coverage를 넓히세요.\n"
                     f"질문: {standalone}\n재작성:"
                 ).text
                 alt_query = _re.sub(r"<think>.*?</think>", "", alt_raw, flags=_re.DOTALL).strip().split("\n")[0].strip()

@@ -5,6 +5,23 @@
 
 ---
 
+## 진행 현황 (2026-04-12 기준)
+
+| Phase | 항목 | 상태 | 결과 |
+|-------|------|------|------|
+| 인프라 | Qdrant 인덱싱 | ✅ 완료 | 4,272건 인덱싱 (UUID5 직접 upsert 방식으로 LlamaIndex 버그 우회) |
+| B-1 | Hybrid+Reranker+Faithfulness 데이터 재구축 | ✅ 완료 | 포함 158건 / 제외 62건 (통과율 72%) |
+| A-1 | documents.jsonl 기반 QA 생성 (2000건) | 🔄 진행 중 | 포함 418건 / 495건 처리 (통과율 84%) `PID 1081398` |
+| 쿼리확장 | LLM alt_query 동의어·유사어 프롬프트 강화 | ✅ 완료 | `export_submission.py` 수정 |
+
+### 주요 이슈 해결 기록
+
+- **Qdrant 0건 버그**: LlamaIndex `upload_points()`가 비-UUID docid("2401.00123")를 HTTP 400으로 거부하나 예외를 삼킴 → `index_qdrant.py`를 `uuid.uuid5` 직접 upsert 방식으로 전면 교체
+- **B-1 Dense 검색 정상화**: Qdrant 수정 후 `[283] RRF 후보 20건 (BM25 0 + Dense 20)` 확인 — BM25 히트 없는 쿼리도 Dense로 커버
+- **A-1 데이터 폐기**: 기존 `sft_data.jsonl` (200건, BM25-only, Faithfulness 미검증)은 품질 미달로 학습에 사용하지 않음
+
+---
+
 ## 현황 진단
 
 ### 현재 SFT의 근본 문제
@@ -54,28 +71,27 @@
 
 ---
 
-## Phase A — documents.jsonl 기반 Gold SFT 데이터 구축 ✅ 구현 완료
+## Phase A — documents.jsonl 기반 Gold SFT 데이터 구축 🔄 진행 중
 
 > **최우선 실행** | 문서-질문-답변 삼각 일관성이 설계 단계에서 보장됨
 
-### 테스트 결과 (10건 실측, 2026-04-12)
+### 실행 현황 (2026-04-12 03:16~ 진행 중)
 
 | 항목 | 수치 |
 |------|------|
-| 문서당 평균 소요 | **16.9초** |
-| Faithfulness 통과율 | 70% (7/10) |
-| 재생성 발생률 | 40% |
-| 최종 제외율 | 30% |
+| 목표 문서 수 | **2,000건** |
+| 현재 처리 | 495건 처리 / 포함 418건 |
+| Faithfulness 통과율 | **84%** (BM25+Dense, --skip-reranker) |
+| 출력 파일 | `artifacts/sft_doc_qa.jsonl` |
+| PID | 1081398 / 로그: `artifacts/build_sft_doc_qa.log` |
 
-**소요 시간 예측** (BM25-only 기준, Solar API 병목)
+**소요 시간 예측** (BM25+Dense 기준, Solar API 병목)
 
 | 대상 | 예상 시간 | 예상 수득 레코드 |
 |------|-----------|----------------|
-| 1,000건 (1차) | ~4.7시간 | ~700건 |
-| 4,272건 (전체) | ~20시간 | ~2,990건 |
+| 2,000건 (현행) | ~8시간 | ~1,680건 |
 
-> 체크포인트 자동 저장 (`artifacts/sft_data_gold.jsonl.ckpt.json`) — 중단 시 동일 명령어로 이어받기 가능.  
-> **야간 배치 실행 권장.**
+> 체크포인트 자동 저장 (`artifacts/sft_doc_qa.jsonl.ckpt.json`) — 중단 시 동일 명령어로 이어받기 가능.
 
 ---
 
@@ -101,37 +117,14 @@ documents.jsonl의 문서 d 선택
 **스크립트**: `scripts/build_sft_from_docs.py`
 
 ```bash
-# 24GB GPU — BM25-only (야간 배치 권장, ~4.7시간/1000건)
-python scripts/build_sft_from_docs.py \
+# 현재 실행 중 (24GB GPU — BM25 + Dense, Reranker 제외, 2000건 목표)
+nohup python scripts/build_sft_from_docs.py \
   --config config/default.yaml \
-  --question-api solar \
-  --answer-api solar \
-  --skip-dense \
+  --question-api solar --answer-api solar \
   --skip-reranker \
-  --max-docs 1000 \
-  --output artifacts/sft_data_gold.jsonl
-
-# 24GB GPU — BM25 + Dense (임베딩 모델 ~18GB, Reranker 제외)
-python scripts/build_sft_from_docs.py \
-  --config config/default.yaml \
-  --question-api solar \
-  --answer-api solar \
-  --skip-reranker \
-  --top-k-retrieve 20 \
-  --top-k-rerank 5 \
-  --max-docs 1000 \
-  --output artifacts/sft_data_gold.jsonl
-
-# 40GB+ GPU — 풀 파이프라인 (BM25 + Dense + Reranker)
-python scripts/build_sft_from_docs.py \
-  --config config/default.yaml \
-  --question-api solar \
-  --answer-api solar \
-  --top-k-retrieve 20 \
-  --top-k-rerank 5 \
-  --faithfulness-threshold 0.7 \
-  --max-docs 1000 \
-  --output artifacts/sft_data_gold.jsonl
+  --max-docs 2000 \
+  --output artifacts/sft_doc_qa.jsonl \
+  > artifacts/build_sft_doc_qa.log 2>&1 &
 
 # 이어받기 (중단 후 재시작) — 동일 명령어 재실행으로 자동 처리
 ```
@@ -197,30 +190,94 @@ A-1에서 문서별로 자동 적용됨:
 
 ## Phase B — eval.jsonl 기반 기존 데이터 정제
 
-> Phase A 완료 후 혼합 데이터로 활용. 단독으로는 품질 한계 있음.
+### B-1. Hybrid 검색 + Reranker 필터로 재구축 ✅ 완료 (2026-04-12)
 
-### B-1. Hybrid 검색 + Reranker 필터로 재구축
-
-현재 BM25 단독 → **BM25 + Dense RRF → Reranker 필터**로 업그레이드
+**결과**: 포함 158건 / 제외 62건 / 오류 0건 (통과율 72%)  
+**출력**: `artifacts/sft_b1_data.jsonl` (298KB)
 
 ```
 query (phase0_csv의 standalone 활용)
-  → BM25 top-20 + Dense top-20 → RRF(k=60) → 후보 top-20
-  → Reranker score 산출
-  → score < 0.3 문서 제거
+  → BM25 top-20 + Dense top-20 → RRF(k=20) → 후보 top-20
+  → Qwen3-Reranker-8B score 산출 (threshold 0.3)
   → Solar API 답변 생성
-  → Faithfulness 게이트 통과 시 포함
+  → RAGAS Faithfulness ≥ 0.7 통과 시 포함 (재생성 1회 허용)
 ```
 
-**스크립트**: `build_sft_data.py` 확장 (신규 인자 `--hybrid`, `--reranker-threshold`)
+**실행 명령**:
+```bash
+nohup python scripts/build_sft_data.py \
+  --config config/default.yaml \
+  --hybrid --reranker-threshold 0.3 \
+  --faithfulness-gate --faithfulness-threshold 0.7 \
+  --answer-api solar \
+  --output artifacts/sft_b1_data.jsonl \
+  > artifacts/build_sft_b1.log 2>&1 &
+```
 
-### B-2. Phase A + B 데이터 혼합
+### B-2. Phase A + B 데이터 혼합 (예정)
+
+> ⚠️ 기존 `sft_data.jsonl` (A-1 이전 생성, BM25-only, Faithfulness 미검증)은 **사용하지 않음**
 
 ```
-최종 학습 데이터 = Phase A (Gold) + Phase B (정제)
-권장 비율: Gold 70% + 정제 30%
+최종 학습 데이터 = Phase A (sft_doc_qa.jsonl) + Phase B-1 (sft_b1_data.jsonl)
+예상 규모: ~1,680건 + 158건 = ~1,838건
 출력: artifacts/sft_data_final.jsonl
 ```
+
+---
+
+## Phase B-3 — Reranker Fine-tuning 검토 (A-1 완료 후)
+
+> **선택적 실행** | A-1 데이터로 트리플렛 자동 구성 가능 여부 확인 후 결정
+
+### 아이디어 개요
+
+Qwen3-Reranker-8B를 한국어 과학 도메인에 맞게 fine-tuning하여  
+일반 도메인 reranker의 한계(동의어·전문 용어 매칭 부족)를 보완한다.
+
+### 학습 데이터 구성 (A-1 부산물 활용)
+
+```
+A-1 처리 흐름에서 자동 생성 가능한 트리플렛:
+
+  (query=생성된 질문, positive=source_docid, negatives=BM25+Dense 검색 결과 중 source 제외)
+
+예상 규모: ~1,680건 트리플렛 (A-1 통과 건수 기준)
+```
+
+| 데이터 소스 | positive | negative | 품질 |
+|------------|---------|---------|------|
+| A-1 source doc | 질문 생성 원본 문서 (구조적 보장) | 동일 쿼리 검색 결과 나머지 | 양호 |
+| B-1 통과 데이터 | Faithfulness 통과 doc_ids | RRF 후보 중 미사용 문서 | 중간 |
+
+### 학습 방식
+
+```
+모델: Qwen/Qwen3-Reranker-8B
+방식: 4-bit QLoRA (bitsandbytes + Unsloth, 24GB VRAM 내 가능)
+손실: Binary Cross-Entropy (query, doc, label=0/1)
+      또는 Pairwise Ranking Loss (positive > negative margin)
+배치: (query, pos, neg) 트리플렛 → in-batch negatives 활용
+```
+
+### 검증 방법
+
+```bash
+# fine-tuning 전/후 reranker 교체 후 MAP 비교
+python scripts/export_submission.py \
+  --pipeline --config config/default.yaml \
+  --phase0-cache artifacts/phase0_queries.csv
+
+python scripts/run_competition_map.py \
+  --submission artifacts/sample_submission.csv
+```
+
+### 판단 기준
+
+- A-1 완료 후 트리플렛 ~1,000건 이상 확보 가능하면 → **진행**
+- MAP 개선이 +0.02 이상이면 채택, 미만이면 기본 Qwen3-Reranker-8B 유지
+
+> ⚠️ 트리플렛 생성 스크립트(`build_reranker_triplets.py`)는 A-1 완료 시점에 구현 예정
 
 ---
 
@@ -332,45 +389,52 @@ SSE events:
 
 ## 전체 실행 순서 요약
 
-| 순서 | Phase | 스크립트 | 상태 | 선행 조건 |
-|------|-------|---------|------|---------|
-| 1 | A-1 | `build_sft_from_docs.py` | ✅ 구현 완료 (야간 배치 예정) | Solar API |
-| 2 | A-2 | `build_sft_summary.py` | ✅ 구현 완료 | Solar API |
-| 3 | B-1 | `build_sft_data.py` 확장 | ⬜ 미시작 | Qdrant + Reranker GPU |
-| 4 | B-2 | 데이터 혼합 스크립트 | ⬜ 미시작 | A-1, B-1 완료 |
-| 5 | C-1 | `train_sft.py` | ⬜ 미시작 | sft_data_final.jsonl |
-| 6 | C-2 | `ragas_eval.py` | ⬜ 미시작 | 학습 완료 |
-| 7 | D   | `serve_app.py`, `index.html` | ⬜ 미시작 | C-2 검증 완료 |
+| 순서 | Phase | 스크립트 | 상태 | 결과 |
+|------|-------|---------|------|------|
+| 0 | 인프라 | `index_qdrant.py` | ✅ 완료 | 4,272건 Qdrant 인덱싱 |
+| 1 | A-1 | `build_sft_from_docs.py` | 🔄 진행 중 (PID 1081398) | 418/2000건 (통과율 84%) |
+| 2 | A-2 | `build_sft_summary.py` | ⬜ 선택적 | Solar API |
+| 3 | B-1 | `build_sft_data.py` | ✅ 완료 | 158건 (통과율 72%) |
+| 4 | B-2 | 데이터 혼합 | ⬜ A-1 완료 후 | A-1 완료 시 |
+| 5 | B-3 | `build_reranker_triplets.py` | 🔍 검토 예정 | A-1 완료 후 트리플렛 규모 확인 |
+| 6 | C-1 | `train_sft.py` | ⬜ 미시작 | sft_data_final.jsonl 필요 |
+| 7 | C-2 | `ragas_eval.py` | ⬜ 미시작 | 학습 완료 후 |
+| 8 | D   | `serve_app.py`, `index.html` | ⬜ 미시작 | C-2 검증 완료 후 |
 
 > **진행 원칙**: 학습 검증(C-2) 완료 전까지 Phase D는 시작하지 않는다.
 
 ---
 
-## 야간 배치 실행 명령어 (현행)
+## 다음 단계 (A-1 완료 후)
 
 ```bash
-# A-1 (1000건, ~4.7시간) — 야간 nohup 실행
-nohup python scripts/build_sft_from_docs.py \
-  --config config/default.yaml \
-  --question-api solar --answer-api solar \
-  --skip-dense --skip-reranker \
-  --max-docs 1000 \
-  --output artifacts/sft_data_gold.jsonl \
-  > artifacts/sft_from_docs.log 2>&1 &
+# 1. A-1 완료 확인
+wc -l artifacts/sft_doc_qa.jsonl
 
-# A-2 (500건, ~1.5시간) — A-1 완료 후 또는 병렬 실행
-nohup python scripts/build_sft_summary.py \
-  --config config/default.yaml \
-  --api solar \
-  --max-docs 500 \
-  --output artifacts/sft_summary_data.jsonl \
-  > artifacts/sft_summary.log 2>&1 &
+# 2. A-1 + B-1 혼합
+cat artifacts/sft_doc_qa.jsonl artifacts/sft_b1_data.jsonl > artifacts/sft_data_final.jsonl
+wc -l artifacts/sft_data_final.jsonl
 
-# 진행 상황 확인
-tail -f artifacts/sft_from_docs.log
-tail -f artifacts/sft_summary.log
+# 3. SFT 학습 (C-1)
+python scripts/train_sft.py \
+  --data artifacts/sft_data_final.jsonl \
+  --model Qwen/Qwen3.5-4B \
+  --output artifacts/qwen35-4b-science-rag
 
-# 생성된 레코드 수 확인
-wc -l artifacts/sft_data_gold.jsonl
-wc -l artifacts/sft_summary_data.jsonl
+# 4. 진행 중인 A-1 상태 확인
+tail -f artifacts/build_sft_doc_qa.log
+wc -l artifacts/sft_doc_qa.jsonl
 ```
+
+## 쿼리 확장 개선 내역 (2026-04-12)
+
+`export_submission.py` Phase 0의 `alt_query` 생성 프롬프트를 강화했다.
+
+**변경 전**: "다음 과학 질문을 다른 표현으로 재작성하세요 (1개만)."
+
+**변경 후**: 동의어·유사어·상위어·하위어를 명시적으로 사용하도록 지시 + few-shot 예시 2개 추가
+```
+예시: '세제 거품 원리' → '비누 계면활성제 기포 생성 원리'
+예시: '광합성 명반응' → '엽록체 빛 에너지 ATP 합성 반응'
+```
+→ BM25 recall 개선 기대 (동의어로 표현된 문서도 검색 커버리지에 포함)
