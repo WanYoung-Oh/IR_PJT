@@ -45,6 +45,7 @@ def run_pipeline(
     top_k_rerank: int = 10,
     top_k_submit: int = 3,
     skip_rewrite: bool = False,
+    skip_dense: bool = False,
     phase0_cache: Path | None = None,
 ) -> list[dict]:
     """전체 RAG 파이프라인을 실행하여 제출 행 목록을 반환한다.
@@ -59,12 +60,14 @@ def run_pipeline(
     from qdrant_client import QdrantClient
 
     from ir_rag.embeddings import build_huggingface_embedding
-    from ir_rag.retrieval import qdrant_dense_doc_ids
+    from ir_rag.retrieval import build_uuid_to_docid, qdrant_dense_doc_ids
 
     eval_path = root / cfg["paths"]["eval"]
     doc_path = root / cfg["paths"]["documents"]
 
     doc_map: dict[str, str] = {d["docid"]: d["content"] for d in iter_jsonl(doc_path)}
+    uuid_to_docid = build_uuid_to_docid(str(doc_path))
+    print(f"UUID→docid 역매핑 {len(uuid_to_docid)}건 로드")
     samples = list(iter_jsonl(eval_path))
 
     es = Elasticsearch(cfg["elasticsearch"]["url"])
@@ -113,31 +116,21 @@ def run_pipeline(
             eid = int(sample["eval_id"])
             msg = sample["msg"]
             science = is_science_question(msg, llm)
-            standalone = build_search_query(msg, llm=llm) if science else msg[-1]["content"]
-
-            # HyDE doc + alt_query: 과학 질문만 생성 (Phase 1에서 3축 RRF에 활용)
-            if science:
-                hyde_doc = generate_hyde_doc(standalone, llm)
-                import re as _re
-                alt_raw = llm.complete(
-                    f"다음 과학 질문을 동의어·유사어를 활용해 다른 표현으로 재작성하세요 (1개만).\n"
-                    f"예시: '세제 거품 원리' → '비누 계면활성제 기포 생성 원리'\n"
-                    f"예시: '광합성 명반응' → '엽록체 빛 에너지 ATP 합성 반응'\n"
-                    f"핵심 용어의 동의어·상위어·하위어를 포함해 검색 coverage를 넓히세요.\n"
-                    f"질문: {standalone}\n재작성:"
-                ).text
-                alt_query = _re.sub(r"<think>.*?</think>", "", alt_raw, flags=_re.DOTALL).strip().split("\n")[0].strip()
+            # 멀티턴만 standalone 재작성, 단일턴은 원본 그대로 사용
+            user_msgs = [m for m in msg if m["role"] == "user"]
+            if science and len(user_msgs) > 1:
+                standalone = build_search_query(msg, llm=llm)
             else:
-                hyde_doc = ""
-                alt_query = ""
+                standalone = user_msgs[-1]["content"] if user_msgs else ""
 
             standalone_queries.append({
                 "eid": eid, "msg": msg, "standalone": standalone,
                 "is_science": science,
-                "hyde_doc": hyde_doc, "alt_query": alt_query,
+                "hyde_doc": "", "alt_query": "",
             })
             tag = "과학" if science else "치챗"
-            print(f"  [{eid}][{tag}] {standalone[:60]}")
+            turn = f"{len(user_msgs)}턴"
+            print(f"  [{eid}][{tag}][{turn}] {standalone[:60]}")
 
         llm = unload_model(llm)
         print("LLM 언로드 완료\n")
@@ -164,15 +157,24 @@ def run_pipeline(
 
     # ── Phase 1: 임베딩 모델로 전체 검색 ────────────────────────────────────
     print("=== Phase 1: Hybrid Retrieval ===")
-    print("임베딩 모델 로드 중 …")
-    embed_model = build_huggingface_embedding(cfg["embedding"])
+    if skip_dense:
+        print("--skip-dense: BM25 단독 검색 (임베딩 모델 로드 생략)")
+        embed_model = None
 
-    def _hybrid_search(query: str) -> list[str]:
-        """BM25 + Dense → RRF(k=20) 결과 docid 목록."""
-        vec = embed_model.get_query_embedding(query)
-        bm25_ids = es_bm25_doc_ids(es, es_index, query, top_k_retrieve)
-        dense_ids = qdrant_dense_doc_ids(qdrant, qdrant_coll, lambda _: vec, query, top_k_retrieve)
-        return list(rrf_score([bm25_ids, dense_ids]).keys())
+        def _hybrid_search(query: str) -> list[str]:
+            """BM25 단독 검색."""
+            bm25_ids = es_bm25_doc_ids(es, es_index, query, top_k_retrieve)
+            return list(rrf_score([bm25_ids]).keys())
+    else:
+        print("임베딩 모델 로드 중 …")
+        embed_model = build_huggingface_embedding(cfg["embedding"])
+
+        def _hybrid_search(query: str) -> list[str]:
+            """BM25 + Dense → RRF(k=20) 결과 docid 목록."""
+            vec = embed_model.get_query_embedding(query)
+            bm25_ids = es_bm25_doc_ids(es, es_index, query, top_k_retrieve)
+            dense_ids = qdrant_dense_doc_ids(qdrant, qdrant_coll, lambda _: vec, query, top_k_retrieve, uuid_to_docid=uuid_to_docid)
+            return list(rrf_score([bm25_ids, dense_ids]).keys())
 
     retrieval_results: list[dict] = []
     for sq in standalone_queries:
@@ -189,11 +191,20 @@ def run_pipeline(
 
         hyde_doc = sq.get("hyde_doc", "")
         alt_query = sq.get("alt_query", "")
+        # <think> 태그 오염된 alt_query/hyde_doc 제거
+        if "<think>" in (alt_query or ""):
+            alt_query = ""
+        if "<think>" in (hyde_doc or ""):
+            hyde_doc = ""
         if hyde_doc and alt_query:
             hyde_ids = _hybrid_search(hyde_doc)
             alt_ids  = _hybrid_search(alt_query)
             rrf = rrf_score([original_ids, hyde_ids, alt_ids])
             axis = "3축(HyDE)"
+        elif hyde_doc or alt_query:
+            extra_ids = _hybrid_search(hyde_doc or alt_query)
+            rrf = rrf_score([original_ids, extra_ids])
+            axis = "2축"
         else:
             rrf = rrf_score([original_ids])
             axis = "1축(원본)"
@@ -308,8 +319,10 @@ def main() -> None:
                         help="플레이스홀더 시 topk를 무작위 docid 3개로 채움")
     parser.add_argument("--pipeline", action="store_true",
                         help="실제 RAG 파이프라인 실행 (ES + Reranker + LLM 필요)")
-    parser.add_argument("--top-k-retrieve", type=int, default=100)
-    parser.add_argument("--top-k-rerank", type=int, default=20)
+    parser.add_argument("--top-k-retrieve", type=int, default=20)
+    parser.add_argument("--top-k-rerank", type=int, default=10)
+    parser.add_argument("--skip-dense", action="store_true",
+                        help="Dense 검색 생략 — BM25 단독 검색 (임베딩 모델 불필요)")
     parser.add_argument("--skip-rewrite", action="store_true",
                         help="Phase 0 건너뜀 — 원본 쿼리로 Phase 1~3만 점검")
     parser.add_argument("--phase0-cache", metavar="CSV",
@@ -338,6 +351,7 @@ def main() -> None:
             top_k_rerank=args.top_k_rerank,
             top_k_submit=top_k,
             skip_rewrite=args.skip_rewrite,
+            skip_dense=args.skip_dense,
             phase0_cache=phase0_cache_path,
         )
     else:

@@ -1,11 +1,29 @@
 from __future__ import annotations
 
+import uuid
 from collections.abc import Callable
 from typing import Any
 
 from elasticsearch import Elasticsearch
 from elasticsearch.exceptions import ConnectionError as ESConnectionError
 from elasticsearch.exceptions import NotFoundError
+
+
+def build_uuid_to_docid(doc_path: str) -> dict[str, str]:
+    """documents.jsonl을 읽어 UUID5(docid) → 원본 docid 역매핑을 생성한다."""
+    import json
+    mapping: dict[str, str] = {}
+    with open(doc_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            doc = json.loads(line)
+            did = doc.get("docid", "")
+            if did:
+                uid = str(uuid.uuid5(uuid.NAMESPACE_DNS, did))
+                mapping[uid] = did
+    return mapping
 
 
 def es_bm25_top_score(es: Elasticsearch, index: str, query: str) -> float:
@@ -51,6 +69,7 @@ def qdrant_dense_doc_ids(
     embed_fn: Callable[[str], list[float]],
     query: str,
     top_k: int,
+    uuid_to_docid: dict[str, str] | None = None,
 ) -> list[str]:
     """Qdrant 컬렉션에서 벡터 검색을 수행하고 docid 목록을 반환한다.
 
@@ -66,6 +85,8 @@ def qdrant_dense_doc_ids(
         검색 쿼리 문자열.
     top_k:
         반환할 최대 결과 수.
+    uuid_to_docid:
+        UUID5 → 원본 docid 역매핑. payload에 docid가 없을 때 폴백으로 사용.
 
     Returns
     -------
@@ -82,7 +103,10 @@ def qdrant_dense_doc_ids(
     doc_ids: list[str] = []
     for hit in response.points:
         payload = hit.payload or {}
-        did = payload.get("docid") or str(hit.id)
+        did = payload.get("docid")
+        if not did:
+            hit_id = str(hit.id)
+            did = (uuid_to_docid or {}).get(hit_id, hit_id)
         doc_ids.append(str(did))
     return doc_ids
 

@@ -26,6 +26,9 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
+from dotenv import load_dotenv
+load_dotenv(ROOT / ".env")
+
 from ir_rag.config import load_config, repo_root_from, resolve_config_path
 from ir_rag.io_util import iter_jsonl, write_jsonl
 
@@ -77,7 +80,7 @@ def main() -> None:
 
     try:
         from ragas import evaluate, RunConfig
-        from ragas.metrics import answer_relevancy, context_recall, faithfulness
+        from ragas.metrics import faithfulness
     except ImportError as e:
         raise SystemExit(
             f"RAGAS 미설치: {e}\n"
@@ -144,14 +147,14 @@ def main() -> None:
     print(f"평가 중 … ({len(dataset)}건)  [재시도 최대 {args.max_retries}회, 대기 최대 {args.max_wait}초]")
     result = evaluate(
         dataset=dataset,
-        metrics=[faithfulness, answer_relevancy, context_recall],
+        metrics=[faithfulness],
         run_config=run_config,
         **eval_kwargs,
     )
 
     if hasattr(result, "to_pandas"):
         df = result.to_pandas()
-        mean_scores = df[["faithfulness", "answer_relevancy", "context_recall"]].mean()
+        mean_scores = df[["faithfulness"]].mean()
         print("\n── RAGAS 평가 결과 ──")
         for metric, score in mean_scores.items():
             print(f"  {metric}: {score:.4f}")
