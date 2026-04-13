@@ -38,6 +38,68 @@ from ir_rag.submission import SubmissionRecord, validate_submission_row
 from ir_rag.vram import unload_model
 
 
+def _llm_select_docs(
+    query: str,
+    candidate_ids: list[str],
+    doc_map: dict[str, str],
+    llm: any,
+    top_k: int = 3,
+) -> list[str]:
+    """Phase 2.5: LLM 프롬프트로 top-k 문서를 선별한다.
+
+    Reranker 점수가 놓치는 의미적 관련성을 LLM이 포착.
+    파싱 실패 또는 선별 수 부족 시 candidate_ids[:top_k] 폴백.
+
+    Parameters
+    ----------
+    candidate_ids:
+        Reranker top-k 결과 docid 목록.
+    doc_map:
+        docid → 본문 매핑.
+    llm:
+        ``llm.complete(prompt)`` 인터페이스를 가진 LLM 객체.
+    """
+    import re
+
+    doc_lines = []
+    valid_ids = [d for d in candidate_ids if d in doc_map]
+    for i, did in enumerate(valid_ids, 1):
+        snippet = doc_map[did][:250].replace("\n", " ")
+        doc_lines.append(f"[문서 {i}] {snippet}")
+    doc_list = "\n".join(doc_lines)
+
+    prompt = (
+        f"질문: {query}\n\n"
+        f"아래 문서 중 질문에 가장 정확하게 답할 수 있는 문서 {top_k}개를 선택하세요.\n"
+        f"문서 번호만 콤마로 구분하여 출력하세요. 예: 1, 3, 5\n\n"
+        f"{doc_list}\n\n"
+        f"선택한 문서 번호 ({top_k}개):"
+    )
+    try:
+        raw = llm.complete(prompt).text
+        # <think> 태그 제거
+        raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+        # 숫자 파싱
+        nums = [int(x.strip()) for x in re.split(r"[,\s]+", raw) if x.strip().isdigit()]
+        # 유효 범위 필터 (1-indexed)
+        selected = [valid_ids[n - 1] for n in nums if 1 <= n <= len(valid_ids)]
+        # 중복 제거, top_k개 확보
+        seen: set[str] = set()
+        result = []
+        for did in selected:
+            if did not in seen:
+                seen.add(did)
+                result.append(did)
+            if len(result) >= top_k:
+                break
+        if len(result) >= top_k:
+            return result
+    except Exception:
+        pass
+    # 폴백: Reranker 점수 순 상위 top_k
+    return valid_ids[:top_k]
+
+
 def run_pipeline(
     cfg: dict,
     root: Path,
@@ -46,15 +108,28 @@ def run_pipeline(
     top_k_submit: int = 3,
     skip_rewrite: bool = False,
     skip_dense: bool = False,
+    bm25_weight: float = 0.7,
+    dense_weight: float = 0.3,
     phase0_cache: Path | None = None,
+    llm_select: bool = False,
+    use_multi_field: bool = False,
 ) -> list[dict]:
     """전체 RAG 파이프라인을 실행하여 제출 행 목록을 반환한다.
 
-    24GB VRAM 제약으로 인해 4-Phase 순차 로드 방식으로 동작한다:
-      Phase 0. LLM 로드 → 쿼리 재작성 + HyDE doc/alt_query 생성 → 언로드
-      Phase 1. 임베딩 모델 로드 → BM25+Dense 3축 RRF(k=20) → 언로드
-      Phase 2. Reranker 로드 → 전체 리랭킹 → 언로드
-      Phase 3. LLM 로드 → 전체 답변 생성 → 언로드
+    24GB VRAM 제약으로 인해 순차 로드 방식으로 동작한다:
+      Phase 0.   LLM 로드 → 쿼리 재작성 + HyDE doc/alt_query 생성 → 언로드
+      Phase 1.   임베딩 모델 로드 → BM25+Dense RRF(k=20) → 언로드
+      Phase 2.   Reranker 로드 → 전체 리랭킹 → 언로드
+      Phase 2.5. (llm_select=True) LLM 로드 → top-k 문서 선별 → 언로드
+      Phase 3.   LLM 로드 → 전체 답변 생성 → 언로드
+
+    Parameters
+    ----------
+    llm_select:
+        True 이면 Phase 2.5를 활성화한다. Reranker 이후 LLM이 최종 문서를 선별한다.
+    use_multi_field:
+        True 이면 BM25 검색 시 title/keywords/summary/content 멀티필드 쿼리를 사용한다.
+        F-2 메타 색인 완료 후 활성화한다.
     """
     from elasticsearch import Elasticsearch
     from qdrant_client import QdrantClient
@@ -123,10 +198,18 @@ def run_pipeline(
             else:
                 standalone = user_msgs[-1]["content"] if user_msgs else ""
 
+            # 과학 쿼리에 HyDE 문서 생성 (3축 BM25 RRF 활성화)
+            # <think> 태그는 strip 후 사용 (버리지 않음)
+            hyde_doc = ""
+            if science and standalone:
+                raw_hyde = generate_hyde_doc(standalone, llm)
+                import re as _re
+                hyde_doc = _re.sub(r"<think>.*?</think>", "", raw_hyde, flags=_re.DOTALL).strip()
+
             standalone_queries.append({
                 "eid": eid, "msg": msg, "standalone": standalone,
                 "is_science": science,
-                "hyde_doc": "", "alt_query": "",
+                "hyde_doc": hyde_doc, "alt_query": "",
             })
             tag = "과학" if science else "치챗"
             turn = f"{len(user_msgs)}턴"
@@ -163,18 +246,18 @@ def run_pipeline(
 
         def _hybrid_search(query: str) -> list[str]:
             """BM25 단독 검색."""
-            bm25_ids = es_bm25_doc_ids(es, es_index, query, top_k_retrieve)
+            bm25_ids = es_bm25_doc_ids(es, es_index, query, top_k_retrieve, use_multi_field=use_multi_field)
             return list(rrf_score([bm25_ids]).keys())
     else:
         print("임베딩 모델 로드 중 …")
         embed_model = build_huggingface_embedding(cfg["embedding"])
 
         def _hybrid_search(query: str) -> list[str]:
-            """BM25 + Dense → RRF(k=20) 결과 docid 목록."""
+            """BM25 + Dense → Weighted RRF 결과 docid 목록."""
             vec = embed_model.get_query_embedding(query)
-            bm25_ids = es_bm25_doc_ids(es, es_index, query, top_k_retrieve)
+            bm25_ids = es_bm25_doc_ids(es, es_index, query, top_k_retrieve, use_multi_field=use_multi_field)
             dense_ids = qdrant_dense_doc_ids(qdrant, qdrant_coll, lambda _: vec, query, top_k_retrieve, uuid_to_docid=uuid_to_docid)
-            return list(rrf_score([bm25_ids, dense_ids]).keys())
+            return list(rrf_score([bm25_ids, dense_ids], weights=[bm25_weight, dense_weight]).keys())
 
     retrieval_results: list[dict] = []
     for sq in standalone_queries:
@@ -189,13 +272,14 @@ def run_pipeline(
 
         original_ids = _hybrid_search(standalone)
 
-        hyde_doc = sq.get("hyde_doc", "")
-        alt_query = sq.get("alt_query", "")
-        # <think> 태그 오염된 alt_query/hyde_doc 제거
-        if "<think>" in (alt_query or ""):
-            alt_query = ""
-        if "<think>" in (hyde_doc or ""):
-            hyde_doc = ""
+        import re as _re
+        hyde_doc = sq.get("hyde_doc", "") or ""
+        alt_query = sq.get("alt_query", "") or ""
+        # <think> 태그 오염 → 버리지 않고 strip 후 사용
+        if "<think>" in hyde_doc:
+            hyde_doc = _re.sub(r"<think>.*?</think>", "", hyde_doc, flags=_re.DOTALL).strip()
+        if "<think>" in alt_query:
+            alt_query = _re.sub(r"<think>.*?</think>", "", alt_query, flags=_re.DOTALL).strip()
         if hyde_doc and alt_query:
             hyde_ids = _hybrid_search(hyde_doc)
             alt_ids  = _hybrid_search(alt_query)
@@ -243,6 +327,30 @@ def run_pipeline(
     reranker = unload_model(reranker)
     print("Reranker 언로드 완료\n")
 
+    # ── Phase 2.5: LLM 최종 문서 선별 (선택) ────────────────────────────────
+    if llm_select:
+        print("=== Phase 2.5: LLM 문서 선별 ===")
+        print("LLM 로드 중 (문서 선별용) …")
+        llm_sel = _load_llm(cfg)
+        for r in rerank_results:
+            if not r["is_science"] or not r["topk_ids"]:
+                continue
+            question = r["msg"][-1]["content"]
+            selected = _llm_select_docs(
+                query=question,
+                candidate_ids=r["topk_ids"],
+                doc_map=doc_map,
+                llm=llm_sel,
+                top_k=top_k_submit,
+            )
+            r["topk_ids_selected"] = selected
+            print(f"  [{r['eid']}] {r['topk_ids'][:3]} → {selected}")
+        llm_sel = unload_model(llm_sel)
+        print("LLM(선별) 언로드 완료\n")
+    else:
+        for r in rerank_results:
+            r["topk_ids_selected"] = r["topk_ids"][:top_k_submit]
+
     # ── Phase 3: LLM으로 전체 답변 생성 ─────────────────────────────────────
     print("=== Phase 3: LLM 답변 생성 ===")
     print("LLM 로드 중 …")
@@ -256,13 +364,14 @@ def run_pipeline(
             refs = []
             topk_final: list[str] = []
         else:
-            context = format_context(r["topk_ids"], doc_map, top_k=top_k_submit)
+            final_ids = r["topk_ids_selected"]
+            context = format_context(final_ids, doc_map, top_k=top_k_submit)
             answer = generate_with_selfcheck(question, context, llm)
             refs = [
                 {"score": float(r["combined"].get(did, 0.0)), "content": doc_map.get(did, "")}
-                for did in r["topk_ids"][:top_k_submit]
+                for did in final_ids
             ]
-            topk_final = r["topk_ids"][:top_k_submit]
+            topk_final = final_ids
         rec = SubmissionRecord(
             eval_id=r["eid"],
             standalone_query=r["standalone"],
@@ -282,13 +391,16 @@ def run_pipeline(
 def _load_llm(cfg: dict):
     """config에 지정된 LLM을 로드한다.
 
-    vllm_url 이 설정된 경우 vLLM OpenAI 호환 API를 사용하고,
-    없으면 LlamaIndex HuggingFaceLLM으로 fallback한다.
+    우선순위:
+    1. vllm.url 설정 시 → vLLM OpenAI 호환 API
+    2. llm.checkpoint 설정 시 → 로컬 fine-tuned 체크포인트 (PEFT LoRA 포함)
+    3. 기본 → HuggingFace hub에서 llm.model_name 직접 로드
     """
     vllm_url = cfg.get("vllm", {}).get("url")
     if vllm_url:
         from llama_index.llms.openai_like import OpenAILike
         model_name = cfg.get("vllm", {}).get("model_name", "science-rag")
+        print(f"LLM: vLLM 서버 사용 ({vllm_url}, model={model_name})")
         return OpenAILike(
             model=model_name,
             api_base=f"{vllm_url}/v1",
@@ -298,11 +410,59 @@ def _load_llm(cfg: dict):
 
     from llama_index.llms.huggingface import HuggingFaceLLM
     llm_cfg = cfg.get("llm", {})
+    base_model = llm_cfg.get("model_name", "Qwen/Qwen3.5-9B")
+    checkpoint = llm_cfg.get("checkpoint") or None  # null/빈 문자열 → None 처리
+    max_new_tokens = llm_cfg.get("max_new_tokens", 512)
+    context_window = llm_cfg.get("context_window", 4096)
+
+    # checkpoint 지정 시: PEFT LoRA 어댑터 병합 후 로드
+    if checkpoint:
+        import os
+        from pathlib import Path
+        ckpt_path = Path(checkpoint)
+        if not ckpt_path.is_absolute():
+            # config 기준 상대경로 → repo root 기준으로 해석
+            from ir_rag.config import repo_root_from
+            ckpt_path = repo_root_from(Path.cwd()) / ckpt_path
+        print(f"LLM: 체크포인트 로드 — base={base_model}, ckpt={ckpt_path}")
+        try:
+            from peft import PeftModel, PeftConfig
+            import torch
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+            peft_cfg = PeftConfig.from_pretrained(str(ckpt_path))
+            # base_model이 config와 다를 수 있으므로 PEFT config 우선
+            actual_base = peft_cfg.base_model_name_or_path or base_model
+            tokenizer = AutoTokenizer.from_pretrained(actual_base)
+            model = AutoModelForCausalLM.from_pretrained(
+                actual_base,
+                torch_dtype=torch.bfloat16,
+                device_map="auto",
+            )
+            model = PeftModel.from_pretrained(model, str(ckpt_path))
+            model = model.merge_and_unload()
+            print(f"  PEFT 어댑터 병합 완료 (base: {actual_base})")
+            return HuggingFaceLLM(
+                model=model,
+                tokenizer=tokenizer,
+                max_new_tokens=max_new_tokens,
+                context_window=context_window,
+            )
+        except Exception as e:
+            print(f"  [경고] PEFT 로드 실패 ({e}), base 모델로 fallback: {ckpt_path}")
+            # fallback: checkpoint를 standalone 모델로 시도
+            return HuggingFaceLLM(
+                model_name=str(ckpt_path),
+                tokenizer_name=str(ckpt_path),
+                max_new_tokens=max_new_tokens,
+                context_window=context_window,
+            )
+
+    print(f"LLM: HuggingFace 모델 로드 — {base_model}")
     return HuggingFaceLLM(
-        model_name=llm_cfg.get("model_name", "Qwen/Qwen3.5-4B"),
-        tokenizer_name=llm_cfg.get("model_name", "Qwen/Qwen3.5-4B"),
-        max_new_tokens=llm_cfg.get("max_new_tokens", 512),
-        context_window=llm_cfg.get("context_window", 4096),
+        model_name=base_model,
+        tokenizer_name=base_model,
+        max_new_tokens=max_new_tokens,
+        context_window=context_window,
     )
 
 
@@ -323,10 +483,18 @@ def main() -> None:
     parser.add_argument("--top-k-rerank", type=int, default=10)
     parser.add_argument("--skip-dense", action="store_true",
                         help="Dense 검색 생략 — BM25 단독 검색 (임베딩 모델 불필요)")
+    parser.add_argument("--bm25-weight", type=float, default=0.7,
+                        help="Hybrid RRF에서 BM25 가중치 (기본 0.7)")
+    parser.add_argument("--dense-weight", type=float, default=0.3,
+                        help="Hybrid RRF에서 Dense 가중치 (기본 0.3)")
     parser.add_argument("--skip-rewrite", action="store_true",
                         help="Phase 0 건너뜀 — 원본 쿼리로 Phase 1~3만 점검")
     parser.add_argument("--phase0-cache", metavar="CSV",
                         help="Phase 0 캐시 CSV 경로 지정 시 Phase 0을 건너뛰고 해당 파일로 Phase 1~3 실행")
+    parser.add_argument("--llm-select", action="store_true",
+                        help="Phase 2.5 활성화: Reranker 이후 LLM이 최종 top-k 문서를 선별")
+    parser.add_argument("--multi-field", action="store_true",
+                        help="BM25 검색 시 title/keywords/summary/content 멀티필드 쿼리 사용 (F-2 색인 후)")
     args = parser.parse_args()
 
     if not args.placeholder and not args.pipeline:
@@ -352,7 +520,11 @@ def main() -> None:
             top_k_submit=top_k,
             skip_rewrite=args.skip_rewrite,
             skip_dense=args.skip_dense,
+            bm25_weight=args.bm25_weight,
+            dense_weight=args.dense_weight,
             phase0_cache=phase0_cache_path,
+            llm_select=args.llm_select,
+            use_multi_field=args.multi_field,
         )
     else:
         rows_out = []

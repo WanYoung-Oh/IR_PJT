@@ -26,11 +26,26 @@ def build_uuid_to_docid(doc_path: str) -> dict[str, str]:
     return mapping
 
 
-def es_bm25_top_score(es: Elasticsearch, index: str, query: str) -> float:
+def es_bm25_top_score(
+    es: Elasticsearch,
+    index: str,
+    query: str,
+    use_multi_field: bool = False,
+) -> float:
+    if use_multi_field:
+        es_query = {
+            "multi_match": {
+                "query": query,
+                "fields": ["title^2", "keywords^1.5", "summary", "content"],
+                "type": "best_fields",
+            }
+        }
+    else:
+        es_query = {"match": {"content": query}}
     try:
         resp = es.search(
             index=index,
-            query={"match": {"content": query}},
+            query=es_query,
             size=1,
             source=False,
         )
@@ -40,11 +55,36 @@ def es_bm25_top_score(es: Elasticsearch, index: str, query: str) -> float:
     return float(hits[0]["_score"]) if hits else 0.0
 
 
-def es_bm25_doc_ids(es: Elasticsearch, index: str, query: str, top_k: int) -> list[str]:
+def es_bm25_doc_ids(
+    es: Elasticsearch,
+    index: str,
+    query: str,
+    top_k: int,
+    use_multi_field: bool = False,
+) -> list[str]:
+    """BM25 검색으로 docid 목록을 반환한다.
+
+    Parameters
+    ----------
+    use_multi_field:
+        ``True`` 이면 title(^2)·keywords(^1.5)·summary·content 멀티필드 검색.
+        F-2 메타 색인 이후에 활성화한다.
+    """
+    if use_multi_field:
+        es_query = {
+            "multi_match": {
+                "query": query,
+                "fields": ["title^2", "keywords^1.5", "summary", "content"],
+                "type": "best_fields",
+            }
+        }
+    else:
+        es_query = {"match": {"content": query}}
+
     try:
         resp = es.search(
             index=index,
-            query={"match": {"content": query}},
+            query=es_query,
             size=top_k,
             source=["docid"],
         )
@@ -118,10 +158,11 @@ def qdrant_dense_doc_ids(
 def rrf_score(
     rankings: list[list[str]],
     k: int = 20,
+    weights: list[float] | None = None,
 ) -> dict[str, float]:
     """여러 검색 결과 랭킹을 RRF 공식으로 통합하여 점수 딕셔너리를 반환한다.
 
-    RRF 공식: score(d) = sum_r( 1 / (k + rank(d, r) + 1) )
+    RRF 공식: score(d) = sum_r( w_r / (k + rank(d, r) + 1) )
     rank 는 0-indexed.
 
     Parameters
@@ -130,17 +171,24 @@ def rrf_score(
         각 검색 시스템이 반환한 docid 리스트의 목록.
         순서가 앞일수록 순위가 높다.
     k:
-        RRF 상수. 기본값 60 (논문 권장값).
+        RRF 상수. 기본값 20.
+    weights:
+        각 랭킹의 가중치. None 이면 균등(1.0) 적용.
+        예: BM25 0.7, Dense 0.3 → weights=[0.7, 0.3]
 
     Returns
     -------
     dict[str, float]
         docid → RRF 점수. 점수 내림차순으로 정렬됨.
     """
+    if weights is None:
+        weights = [1.0] * len(rankings)
+    if len(weights) != len(rankings):
+        raise ValueError(f"weights 길이({len(weights)})가 rankings 길이({len(rankings)})와 다릅니다.")
     scores: dict[str, float] = {}
-    for ranking in rankings:
+    for ranking, w in zip(rankings, weights):
         for rank, doc_id in enumerate(ranking):
-            scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (k + rank + 1)
+            scores[doc_id] = scores.get(doc_id, 0.0) + w / (k + rank + 1)
     return dict(sorted(scores.items(), key=lambda x: x[1], reverse=True))
 
 
