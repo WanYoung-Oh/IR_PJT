@@ -113,6 +113,7 @@ def run_pipeline(
     phase0_cache: Path | None = None,
     llm_select: bool = False,
     use_multi_field: bool = False,
+    skip_generation: bool = False,
 ) -> list[dict]:
     """전체 RAG 파이프라인을 실행하여 제출 행 목록을 반환한다.
 
@@ -121,12 +122,20 @@ def run_pipeline(
       Phase 1.   임베딩 모델 로드 → BM25+Dense RRF(k=20) → 언로드
       Phase 2.   Reranker 로드 → 전체 리랭킹 → 언로드
       Phase 2.5. (llm_select=True) LLM 로드 → top-k 문서 선별 → 언로드
-      Phase 3.   LLM 로드 → 전체 답변 생성 → 언로드
+      Phase 3.   LLM 로드 → 전체 답변 생성 → 언로드  ← skip_generation=True 시 생략
 
     Parameters
     ----------
+    skip_dense:
+        True 이면 Dense(Qdrant) 검색을 생략하고 BM25 단독 검색을 사용한다.
+        Dense 인덱스 오염 확인 후 기본값으로 사용 권장.
+    skip_generation:
+        True 이면 Phase 3 LLM 답변 생성을 생략한다.
+        topk 문서 선별에만 집중하는 검색 실험 시 사용. 답변은 placeholder로 대체.
+        Phase 0도 --phase0-cache와 함께 사용하면 LLM 로드 없이 검색+재순위만 실행.
     llm_select:
         True 이면 Phase 2.5를 활성화한다. Reranker 이후 LLM이 최종 문서를 선별한다.
+        skip_generation=True 시 자동으로 비활성화된다.
     use_multi_field:
         True 이면 BM25 검색 시 title/keywords/summary/content 멀티필드 쿼리를 사용한다.
         F-2 메타 색인 완료 후 활성화한다.
@@ -328,6 +337,8 @@ def run_pipeline(
     print("Reranker 언로드 완료\n")
 
     # ── Phase 2.5: LLM 최종 문서 선별 (선택) ────────────────────────────────
+    if skip_generation:
+        llm_select = False  # 생성 생략 시 선별도 비활성화
     if llm_select:
         print("=== Phase 2.5: LLM 문서 선별 ===")
         print("LLM 로드 중 (문서 선별용) …")
@@ -352,11 +363,39 @@ def run_pipeline(
             r["topk_ids_selected"] = r["topk_ids"][:top_k_submit]
 
     # ── Phase 3: LLM으로 전체 답변 생성 ─────────────────────────────────────
+    rows_out: list[dict] = []
+
+    if skip_generation:
+        # 검색 실험 모드: LLM 없이 topk만 확정, 답변은 placeholder
+        print("=== Phase 3: 생략 (--skip-generation) ===")
+        print("topk 문서 선별 결과만 출력합니다. 답변은 placeholder로 대체됩니다.")
+        for r in rerank_results:
+            if not r["is_science"]:
+                final_ids = []
+                refs = []
+            else:
+                final_ids = r["topk_ids_selected"]
+                refs = [
+                    {"score": float(r["combined"].get(did, 0.0)), "content": doc_map.get(did, "")}
+                    for did in final_ids
+                ]
+            rec = SubmissionRecord(
+                eval_id=r["eid"],
+                standalone_query=r["standalone"],
+                topk=final_ids,
+                answer="[RETRIEVAL ONLY]",
+                references=refs,
+            )
+            row = rec.to_dict()
+            validate_submission_row(row)
+            rows_out.append(row)
+            print(f"  [{r['eid']}] → {final_ids}")
+        return rows_out
+
     print("=== Phase 3: LLM 답변 생성 ===")
     print("LLM 로드 중 …")
     llm = _load_llm(cfg)
 
-    rows_out: list[dict] = []
     for r in rerank_results:
         question = r["msg"][-1]["content"]
         if not r["is_science"]:
@@ -495,6 +534,9 @@ def main() -> None:
                         help="Phase 2.5 활성화: Reranker 이후 LLM이 최종 top-k 문서를 선별")
     parser.add_argument("--multi-field", action="store_true",
                         help="BM25 검색 시 title/keywords/summary/content 멀티필드 쿼리 사용 (F-2 색인 후)")
+    parser.add_argument("--skip-generation", action="store_true",
+                        help="Phase 3 LLM 답변 생성 생략. topk 문서 선별만 수행하여 검색 실험 속도 향상."
+                             " 답변은 placeholder로 대체됨. MAP(문서 일치율) 측정용.")
     args = parser.parse_args()
 
     if not args.placeholder and not args.pipeline:
@@ -525,6 +567,7 @@ def main() -> None:
             phase0_cache=phase0_cache_path,
             llm_select=args.llm_select,
             use_multi_field=args.multi_field,
+            skip_generation=args.skip_generation,
         )
     else:
         rows_out = []

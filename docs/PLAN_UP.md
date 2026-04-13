@@ -33,11 +33,14 @@
 | C-1    | SFT 학습 (Qwen3.5-4B QLoRA 4-bit)              | ✅ 완료        | `artifacts/qwen35-4b-science-rag` — **오염 데이터 영향으로 폐기**  |
 | C-2    | 리더보드 제출 #2 (4B SFT)                      | ✅ 완료        | **MAP=0.3364** (Dense 노이즈 + `<think>` 오염)                     |
 | D-1~3  | MAP 하락 원인 분석 + BM25 단독 실험            | ✅ 완료        | 제출 #3 MAP=0.4364 — HyDE 미사용이 핵심 원인                       |
-| E-1    | Weighted RRF + HyDE 복원 + 9B LLM 전환        | 🔄 진행 중     | Qwen3.5-9B + BM25:Dense=7:3 + HyDE 2축 파이프라인 실행 중         |
-| F-1    | 문서 메타 정보 생성                            | 🔧 구현 완료   | `scripts/build_doc_metadata.py` 구현 완료 — E-1 결과 후 실행      |
-| F-2    | ES 재인덱싱 (LMJelinekMercer + 동의어 + 메타) | 🔧 구현 완료   | `scripts/build_synonyms.py` + `index_es.py` 수정 완료             |
+| E-1    | Weighted RRF + HyDE 복원 + 9B LLM 전환        | ✅ 완료        | **MAP=0.3864** — Dense 7:3에서도 오염 지속, 베이스라인 미달       |
+| E-5    | BM25-only + HyDE 3축 + 9B LLM                 | ⬜ 미시작      | Dense 완전 배제, 베이스라인 회복 목표                              |
+| F-1    | 문서 메타 정보 생성                            | ✅ 완료        | 4,272건 생성 → `artifacts/doc_metadata.jsonl` (2.1MB)              |
+| F-2a   | 과학 동의어 사전 생성                          | ✅ 완료        | 233개 규칙 → `artifacts/science_synonyms.txt`                      |
+| F-2b   | ES 재인덱싱 (LMJelinekMercer + 동의어 + 메타) | ✅ 완료        | 사용자사전 750개 + 동의어 233개 + 멀티필드 + LMJelinekMercer 적용  |
 | G-1    | LLM 최종 문서 선별 (Phase 2.5)                 | 🔧 구현 완료   | `export_submission.py --llm-select` 플래그로 활성화                |
-| B-3    | Reranker Fine-tuning                           | 🔧 구현 완료   | `build_reranker_triplets.py` + `train_reranker.py` 구현 완료       |
+| B-3a   | Reranker 트리플렛 생성                         | ✅ 완료        | 1,747건 → `artifacts/reranker_triplets.jsonl`                      |
+| B-3b   | Reranker Fine-tuning                           | 🔄 진행 중     | Qwen3-Reranker-8B QLoRA, 1968 steps / 3 epoch, 약 5~6시간 소요     |
 
 ### 주요 이슈 해결 기록
 
@@ -54,6 +57,19 @@
 | 1 | 베이스라인 (BM25 + HyDE 3축 + Reranker + 4B LLM) | **0.6682** | 0.6682 | `old/sample_submission_clean_1.csv` |
 | 2 | Hybrid(BM25+Dense 균등) + alt_query + Reranker + 4B SFT | **0.3364** | 0.3379 | Dense 노이즈 + `<think>` 오염 |
 | 3 | BM25 단독(--skip-dense) + Reranker + 4B SFT | **0.4364** | 0.4379 | HyDE 미사용으로 베이스라인 미달 |
+| E-1 | BM25+Dense 7:3 + HyDE 2축 + Reranker + 9B | **0.3864** | 0.3879 | Dense 7:3에서도 오염 지속 |
+
+### Dense 오염 패턴 분석
+
+| 실험 | Dense | MAP | 비고 |
+|---|---|---|---|
+| #1 (baseline) | ❌ 없음 | **0.6682** | BM25 3축 |
+| #3 | ❌ 없음 | 0.4364 | BM25 1축 (HyDE 미사용) |
+| #2 | ✅ 균등 | 0.3364 | Dense 오염 최악 |
+| E-1 | ✅ 7:3 | 0.3864 | Dense 비중 줄여도 오염 지속 |
+
+**결론**: Dense 인덱스에 근본적 문제 존재. 가중치 조정으로는 해결 불가.
+→ Dense 완전 배제 후 BM25 품질(F-1/F-2) 향상에 집중하는 전략으로 전환.
 
 ### 실험 #3 갭 원인 분석 (0.4364 vs 0.6682)
 
@@ -87,21 +103,32 @@ Phase 2: Qwen3-Reranker-8B
 Phase 3: Qwen3.5-9B 답변 생성
 ```
 
-#### E-1 실행 명령
+#### E-1 결과: MAP=0.3864 — Dense 오염 지속 확인
+
+#### E-5. BM25-only + HyDE 3축 + 9B LLM ← 다음 실험
+
+Dense를 완전히 배제하고 HyDE + alt_query 3축 BM25 RRF를 복원한다.
+Phase 0 캐시를 재사용하므로 빠르게 실행 가능.
 
 ```bash
+# phase0 캐시 재사용 (HyDE/alt_query 이미 생성됨)
 python scripts/export_submission.py \
   --pipeline --config config/default.yaml \
-  --bm25-weight 0.7 --dense-weight 0.3 \
-  --output artifacts/sample_submission_9b_w73.csv
+  --skip-dense \
+  --phase0-cache artifacts/phase0_queries.csv \
+  --output artifacts/sample_submission_e5_bm25_hyde.csv
 ```
 
-#### E-2~E-4 다음 실험 후보 (E-1 결과 확인 후 결정)
+**예상**: HyDE 3축이 살아있으므로 베이스라인 #1(0.6682) 수준 회복 기대.
+9B vs 4B 모델 차이가 있으나 검색 품질이 회복되면 근접할 것으로 판단.
 
-| 실험 | 설명 | 예상 효과 |
+#### 이후 실험 후보 (E-5 결과 확인 후)
+
+| 실험 | 설명 | 조건 |
 |---|---|---|
-| E-2 | BM25:Dense 비율 조정 (8:2, 9:1) | Dense 노이즈 추가 감소 |
-| E-4 | HyDE + alt_query 3축 복원 | MAP 추가 향상 가능성 |
+| F-1→F-2 | 메타 색인 + LMJelinekMercer + 동의어 | E-5 MAP ≥ 0.60 이면 착수 |
+| G-1 | LLM 최종 문서 선별 (--llm-select) | F-2 완료 후 또는 E-5 직후 단독 테스트 |
+| Dense 재인덱싱 | Qdrant 인덱스 재구축 후 재실험 | 원인 파악 후 별도 검토 |
 
 ---
 
@@ -332,16 +359,17 @@ python scripts/run_competition_map.py \
 | 1    | A-1    | `build_sft_from_docs.py`                              | ✅ 완료        | 1,747건 / 통과율 87.4%                        |
 | 2    | B-1·2  | `build_sft_data.py` → 혼합                            | ✅ 완료        | 1,905건 → `sft_data_final.jsonl`              |
 | 3    | C-1    | `train_sft.py`                                        | ✅ 완료        | 4B SFT — 오염으로 폐기, 9B 기본 모델 전환    |
-| 4    | E-1    | `export_submission.py`                                | 🔄 진행 중     | Qwen3.5-9B + HyDE 2축 + BM25:Dense 7:3       |
-| 5    | F-1    | `build_doc_metadata.py`                               | 🔧 구현 완료   | E-1 결과 확인 후 실행                         |
-| 6    | F-2    | `build_synonyms.py` + `index_es.py --recreate`        | 🔧 구현 완료   | F-1 완료 후 실행                              |
-| 7    | G-1    | `export_submission.py --llm-select`                   | 🔧 구현 완료   | F-2 완료 후 실행 (또는 먼저 단독 테스트 가능) |
-| 8    | B-3    | `build_reranker_triplets.py` + `train_reranker.py`    | 🔧 구현 완료   | G-1 이후 또는 병행                            |
-| 9    | D      | `serve_app.py` + `static/index.html`                  | ⬜ 미시작      | 서빙 UI — 전체 검증 완료 후                   |
+| 4    | E-1    | `export_submission.py`                                | ✅ 완료        | MAP=0.3864 — Dense 오염 지속 확인             |
+| 5    | E-5    | `export_submission.py --skip-dense`                   | ⬜ 미시작      | BM25-only + HyDE 3축, 베이스라인 회복 목표    |
+| 6    | F-1    | `build_doc_metadata.py`                               | ✅ 완료        | 4,272건 메타 생성 → `doc_metadata.jsonl`      |
+| 7    | F-2a   | `build_synonyms.py`                                   | ✅ 완료        | 동의어 233개 규칙 → `science_synonyms.txt`    |
+| 8    | F-2b   | `index_es.py --lm-jelinek-mercer --recreate`          | ✅ 완료        | LMJelinekMercer + 동의어 + 멀티필드 적용      |
+| 9    | B-3a   | `build_reranker_triplets.py`                          | ✅ 완료        | 1,747건 트리플렛 → `reranker_triplets.jsonl`  |
+| 10   | B-3b   | `train_reranker.py`                                   | 🔄 진행 중     | QLoRA 학습 중 (1968 steps / 3 epoch, ~5~6시간)|
+| 11   | G-1    | `export_submission.py --llm-select`                   | 🔧 구현 완료   | B-3b 완료 후 또는 E-5 병행 실험               |
+| 12   | D      | `serve_app.py` + `static/index.html`                  | ⬜ 미시작      | 서빙 UI — 전체 검증 완료 후                   |
 
-> **분기 조건** (E-1 MAP 기준):
-> - MAP < 0.75 → F-1 → F-2 → G-1 → B-3 전체 순서대로 진행
-> - MAP ≥ 0.75 → G-1 먼저 단독 테스트, 병행으로 F-1 시작
+> **현재 우선순위**: B-3b 학습 완료 대기 중. 그 사이 E-5(BM25-only + HyDE) 실험으로 베이스라인 회복 확인 권장.
 
 ---
 
@@ -363,7 +391,7 @@ python scripts/run_competition_map.py \
 | `src/ir_rag/es_util.py` | `ES_META_MAPPINGS` 추가, `_build_settings()` LMJelinekMercer·동의어 파라미터, `load_synonyms_file()`, `ensure_index()` 파라미터 확장 |
 | `src/ir_rag/retrieval.py` | `es_bm25_doc_ids()` / `es_bm25_top_score()` — `use_multi_field` 파라미터 추가 |
 | `scripts/index_es.py` | `--metadata`, `--synonyms`, `--lm-jelinek-mercer` CLI 옵션 추가 |
-| `scripts/export_submission.py` | `_llm_select_docs()` + Phase 2.5 삽입, `--llm-select` / `--multi-field` CLI 옵션 추가, `run_pipeline()` 파라미터 확장 |
+| `scripts/export_submission.py` | `_llm_select_docs()` + Phase 2.5 삽입, `--llm-select` / `--multi-field` / `--skip-generation` CLI 옵션 추가, `run_pipeline()` 파라미터 확장 |
 
 ---
 
@@ -414,11 +442,20 @@ documents.jsonl의 문서 d →
 ## 부록 — 자주 쓰는 명령어 모음
 
 ```bash
-# E-1 파이프라인 (현재 실행 중)
+# E-5: BM25-only + HyDE 3축 (베이스라인 회복 확인용)
 python scripts/export_submission.py \
   --pipeline --config config/default.yaml \
-  --bm25-weight 0.7 --dense-weight 0.3 \
-  --output artifacts/sample_submission_9b_w73.csv
+  --skip-dense \
+  --phase0-cache artifacts/phase0_queries.csv \
+  --output artifacts/sample_submission_e5_bm25_hyde.csv
+
+# E-5 + F-2 멀티필드 + 생성 생략 (검색 품질만 빠르게 확인)
+python scripts/export_submission.py \
+  --pipeline --config config/default.yaml \
+  --skip-dense --multi-field \
+  --phase0-cache artifacts/phase0_queries.csv \
+  --skip-generation \
+  --output artifacts/sample_submission_f2_retrieval.csv
 
 # Phase 0 캐시 재사용 (빠른 재실험)
 python scripts/export_submission.py \
@@ -449,6 +486,26 @@ python scripts/run_competition_map.py \
 
 # 제출 형식 검증
 python scripts/validate_submission.py artifacts/sample_submission_9b_w73.csv
+```
+
+```bash
+# 검색 실험 모드 (LLM 생성 생략 — 빠른 MAP 측정)
+# --skip-dense: Dense 오염 확인으로 기본 옵션
+# --skip-generation: Phase 3 LLM 로드 생략 → 검색+재순위만 실행
+python scripts/export_submission.py \
+  --pipeline --config config/default.yaml \
+  --skip-dense \
+  --phase0-cache artifacts/phase0_queries.csv \
+  --skip-generation \
+  --output artifacts/sample_submission_retrieval_only.csv
+
+# F-2 완료 후 멀티필드 검색 적용 (생성 생략)
+python scripts/export_submission.py \
+  --pipeline --config config/default.yaml \
+  --skip-dense --multi-field \
+  --phase0-cache artifacts/phase0_queries.csv \
+  --skip-generation \
+  --output artifacts/sample_submission_f2_retrieval.csv
 ```
 
 ```yaml
