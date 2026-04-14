@@ -4,6 +4,10 @@
 > 검색 품질 개선 → LLM 품질 개선 순으로 진행한다.
 >
 > **갱신 (2026-04-14)**: G-1(`--llm-select`) 리더보드 제출 **MAP=MRR=0.8795** — 목표 0.85+ 달성. B-3b(Reranker QLoRA) 단독 제출 **MAP=MRR=0.2439** (기대 대비 저조; 추론·데이터 점검 대상).
+>
+> **갱신 (2026-04-14)**: Phase 0 캐시 `artifacts/phase0_queries_llm_select_total_solar.csv` + Phase 1 다축 RRF 가중치 **`--rrf-weights 0.5,0.25,0.25`** (standalone / HyDE / alt) 적용 제출 — 리더보드 **MAP=0.8386 / MRR=0.8424**. (G-1 대비 설정·캐시가 다르면 수치 직접 비교는 참고용.)
+>
+> **갱신 (2026-04-14)**: 다축 RRF **`--rrf-weights 0.6,0.15,0.25`** (standalone 비중 확대) 제출 — 리더보드 **MAP=MRR=0.5652**. G-2(0.5/0.25/0.25) 대비 하락. 후속으로 standalone 비중을 줄이고 HyDE·alt에 조금 더 두는 조합(예: **0.4, 0.3, 0.3**) 실험이 유효할 수 있음.
 
 ---
 
@@ -41,6 +45,7 @@
 | F-2a   | 과학 동의어 사전 생성                          | ✅ 완료        | 233개 규칙 → `artifacts/science_synonyms.txt`                      |
 | F-2b   | ES 재인덱싱 (LMJelinekMercer + 동의어 + 메타) | ✅ 완료        | 사용자사전 750개 + 동의어 233개 + 멀티필드 + LMJelinekMercer 적용  |
 | G-1    | LLM 최종 문서 선별 (Phase 2.5)                 | ✅ 완료        | 리더보드 **MAP=MRR=0.8795** (`export_submission.py --llm-select`)  |
+| G-2    | Solar Phase0 캐시 + 다축 RRF 가중 (0.5/0.25/0.25) | ✅ 완료        | 리더보드 **MAP=0.8386 / MRR=0.8424** (`--phase0-cache` + `--rrf-weights`) |
 | B-3a   | Reranker 트리플렛 생성                         | ✅ 완료        | 1,747건 → `artifacts/reranker_triplets.jsonl`                      |
 | B-3b   | Reranker Fine-tuning                           | ✅ 완료        | QLoRA 1968 steps / 3 epoch — 리더보드 **MAP=MRR=0.2439** (기대 대비 저조; 점검 대상) |
 
@@ -62,6 +67,8 @@
 | E-1 | BM25+Dense 7:3 + HyDE 2축 + Reranker + 9B | **0.3864** | 0.3879 | Dense 7:3에서도 오염 지속 |
 | B-3b | 파인튜닝 Reranker(QLoRA) 적용 제출 | **0.2439** | 0.2439 | Reranker만 교체; 기대 대비 저조 |
 | G-1 | `--llm-select` LLM 최종 문서 선별 | **0.8795** | 0.8795 | 목표 0.85+ 달성 |
+| G-2 | `phase0_queries_llm_select_total_solar.csv` + `--rrf-weights 0.5,0.25,0.25` | **0.8386** | **0.8424** | Solar Phase0 캐시; 다축 RRF에서 standalone 가중 |
+| RRF | `--rrf-weights 0.6,0.15,0.25` | **0.5652** | **0.5652** | standalone 0.6·HyDE 0.15·alt 0.25; G-2 대비 하락 → 균형 잡힌 가중(예: 0.4/0.3/0.3) 추가 실험 후보 |
 
 ### Dense 오염 패턴 분석
 
@@ -379,9 +386,10 @@ python scripts/run_competition_map.py \
 | 9    | B-3a   | `build_reranker_triplets.py`                          | ✅ 완료        | 1,747건 트리플렛 → `reranker_triplets.jsonl`  |
 | 10   | B-3b   | `train_reranker.py`                                   | ✅ 완료        | 리더보드 MAP=MRR=0.2439 — Reranker 단독 교체 제출                |
 | 11   | G-1    | `export_submission.py --llm-select`                   | ✅ 완료        | 리더보드 MAP=MRR=0.8795 — 목표 0.85+ 달성                     |
-| 12   | D      | `serve_app.py` + `static/index.html`                  | ⬜ 미시작      | 서빙 UI — 전체 검증 완료 후                   |
+| 12   | G-2    | `export_submission.py` `--rrf-weights` + Phase0 Solar 캐시 | ✅ 완료        | 리더보드 MAP=0.8386 / MRR=0.8424 (`phase0_queries_llm_select_total_solar.csv`) |
+| 13   | D      | `serve_app.py` + `static/index.html`                  | ⬜ 미시작      | 서빙 UI — 전체 검증 완료 후                   |
 
-> **현재 우선순위**: G-1으로 MAP 0.85+ 달성. B-3b 단독(0.2439)은 저조 — Reranker 추론 경로·데이터 점검. E-5(BM25-only + HyDE)는 선택적으로 베이스라인 회복 비교용.
+> **현재 우선순위**: G-1으로 MAP 0.85+ 달성. G-2는 동일 목표 구간에서 다축 RRF 가중·Solar Phase0 캐시 조합 기록. B-3b 단독(0.2439)은 저조 — Reranker 추론 경로·데이터 점검. E-5(BM25-only + HyDE)는 선택적으로 베이스라인 회복 비교용.
 
 ---
 

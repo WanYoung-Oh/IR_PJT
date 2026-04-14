@@ -17,6 +17,10 @@
     # Phase 0·3 을 Solar Pro API만 사용 (로컬 LLM 미사용, SOLAR_API_KEY 필요)
     python scripts/export_submission.py --pipeline --config config/default.yaml \\
       --phase0-api solar --phase3-api solar
+
+    # standalone / HyDE / alt 3축 RRF 가중치 (기본은 균등 1,1,1)
+    python scripts/export_submission.py --pipeline --config config/default.yaml \\
+      --rrf-weights 0.5,0.25,0.25
 """
 from __future__ import annotations
 
@@ -129,6 +133,7 @@ def run_pipeline(
     skip_generation: bool = False,
     phase0_backend: str = "hf",
     phase3_backend: str = "hf",
+    axis_rrf_weights: tuple[float, float, float] | None = None,
 ) -> list[dict]:
     """전체 RAG 파이프라인을 실행하여 제출 행 목록을 반환한다.
 
@@ -160,6 +165,9 @@ def run_pipeline(
     phase3_backend:
         ``"hf"`` (기본) 로컬 LLM, ``"solar"`` Solar Pro API (answer 생성 및
         ``--llm-select`` 시 문서 선별).
+    axis_rrf_weights:
+        ``(standalone, HyDE, alt_query)`` 순서의 Phase 1 다축 RRF 가중치.
+        ``None`` 이면 균등 ``(1.0, 1.0, 1.0)``. 2축일 때는 (standalone, 존재하는 축)에 매핑.
     """
     from elasticsearch import Elasticsearch
     from qdrant_client import QdrantClient
@@ -277,7 +285,9 @@ def run_pipeline(
         print(f"Phase 0 중간 저장 완료 → {phase0_out} ({len(standalone_queries)}건)\n")
 
     # ── Phase 1: 임베딩 모델로 전체 검색 ────────────────────────────────────
+    w0, w1, w2 = axis_rrf_weights if axis_rrf_weights is not None else (1.0, 1.0, 1.0)
     print("=== Phase 1: Hybrid Retrieval ===")
+    print(f"  다축 RRF 가중치 (standalone / HyDE / alt): {w0:g}, {w1:g}, {w2:g}")
     if skip_dense:
         print("--skip-dense: BM25 단독 검색 (임베딩 모델 로드 생략)")
         embed_model = None
@@ -320,13 +330,17 @@ def run_pipeline(
             alt_query = _re.sub(r"<think>.*?</think>", "", alt_query, flags=_re.DOTALL).strip()
         if hyde_doc and alt_query:
             hyde_ids = _hybrid_search(hyde_doc)
-            alt_ids  = _hybrid_search(alt_query)
-            rrf = rrf_score([original_ids, hyde_ids, alt_ids])
+            alt_ids = _hybrid_search(alt_query)
+            rrf = rrf_score([original_ids, hyde_ids, alt_ids], weights=[w0, w1, w2])
             axis = "3축(HyDE)"
-        elif hyde_doc or alt_query:
-            extra_ids = _hybrid_search(hyde_doc or alt_query)
-            rrf = rrf_score([original_ids, extra_ids])
-            axis = "2축"
+        elif hyde_doc:
+            extra_ids = _hybrid_search(hyde_doc)
+            rrf = rrf_score([original_ids, extra_ids], weights=[w0, w1])
+            axis = "2축(HyDE)"
+        elif alt_query:
+            extra_ids = _hybrid_search(alt_query)
+            rrf = rrf_score([original_ids, extra_ids], weights=[w0, w2])
+            axis = "2축(alt)"
         else:
             rrf = rrf_score([original_ids])
             axis = "1축(원본)"
@@ -587,6 +601,13 @@ def main() -> None:
         default="hf",
         help="Phase 3: answer 생성 — hf=로컬 LLM, solar=Solar Pro API. --llm-select 시 동일 백엔드 사용.",
     )
+    parser.add_argument(
+        "--rrf-weights",
+        default=None,
+        metavar="W,W,W",
+        help="Phase 1에서 standalone / HyDE / alt_query 다축 RRF 가중치 (쉼표로 3개). "
+             "예: 0.5,0.25,0.25. 기본은 균등 1,1,1. 2축일 때는 standalone과 존재하는 축에만 적용.",
+    )
     args = parser.parse_args()
 
     if not args.placeholder and not args.pipeline:
@@ -605,6 +626,17 @@ def main() -> None:
             print(f"실제 파이프라인 모드 실행 중 … (Phase 0 캐시: {phase0_cache_path})")
         else:
             print("실제 파이프라인 모드 실행 중 …")
+        axis_rrf_weights: tuple[float, float, float] | None = None
+        if args.rrf_weights:
+            parts = [p.strip() for p in args.rrf_weights.split(",") if p.strip()]
+            if len(parts) != 3:
+                parser.error(
+                    "--rrf-weights 는 세 개의 숫자를 쉼표로 구분해 주세요. 예: 0.5,0.25,0.25"
+                )
+            try:
+                axis_rrf_weights = (float(parts[0]), float(parts[1]), float(parts[2]))
+            except ValueError as e:
+                parser.error(f"--rrf-weights 파싱 실패: {e}")
         rows_out = run_pipeline(
             cfg, root,
             top_k_retrieve=args.top_k_retrieve,
@@ -620,6 +652,7 @@ def main() -> None:
             skip_generation=args.skip_generation,
             phase0_backend=args.phase0_api,
             phase3_backend=args.phase3_api,
+            axis_rrf_weights=axis_rrf_weights,
         )
     else:
         rows_out = []

@@ -998,7 +998,7 @@ def evaluate_map(eval_path: str, retriever,
 
 **스크립트**
 
-- [scripts/export_submission.py](../scripts/export_submission.py): `--placeholder` 로 형식만 채움; 실제 파이프라인은 베이스라인 `answer_question` 과 같은 5필드 dict 로 직렬화.
+- [scripts/export_submission.py](../scripts/export_submission.py): `--placeholder` 로 형식만 채움; 실제 파이프라인은 베이스라인 `answer_question` 과 같은 5필드 dict 로 직렬화. Phase 1 다축 RRF에 **`--rrf-weights`** (standalone / HyDE / alt) 옵션 지원 — 실험 기록은 [PLAN_UP.md](PLAN_UP.md) G-2.
 - [scripts/run_competition_map.py](../scripts/run_competition_map.py): `--submission` + `--gt` 로 `calc_map` 계산 ([src/ir_rag/competition_metrics.py](../src/ir_rag/competition_metrics.py)).
 - [scripts/validate_submission.py](../scripts/validate_submission.py): 필수 키 검사.
 

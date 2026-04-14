@@ -42,8 +42,8 @@ reranker:
 #   checkpoint: "artifacts/qwen35-4b-science-rag"  # SFT 체크포인트
 #   checkpoint: null                                # HuggingFace 기본 모델
 llm:
-  model_name: "Qwen/Qwen3.5-9B"
-  checkpoint: null
+  model_name: "Qwen/Qwen3.5-4B"
+  checkpoint: "artifacts/qwen35-4b-science-rag"
   max_new_tokens: 512
   context_window: 4096
 

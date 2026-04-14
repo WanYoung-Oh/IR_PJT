@@ -578,11 +578,25 @@ python scripts/export_submission.py \
   --phase3-api solar
 ```
 
+**Phase 0 캐시(Solar 생성 CSV) + 다축 RRF 가중** (리더보드 기록 예: `phase0_queries_llm_select_total_solar.csv` + `--rrf-weights 0.5,0.25,0.25` → MAP/MRR 약 0.8386/0.8424 — [`PLAN_UP.md`](PLAN_UP.md) 실험 G-2):
+
+```bash
+python scripts/export_submission.py \
+  --pipeline \
+  --config config/default.yaml \
+  --phase0-cache artifacts/phase0_queries_llm_select_total_solar.csv \
+  --rrf-weights 0.5,0.25,0.25 \
+  --multi-field --llm-select \
+  --phase0-api solar --phase3-api solar \
+  -o artifacts/sample_submission_weighted_3axis.csv
+```
+
 | 옵션 | 기본값 | 설명 |
 | --- | --- | --- |
 | `--phase0-api` | `hf` | `hf` = `config`의 로컬 LLM · `solar` = Solar Pro (standalone·HyDE·alt_query·과학 판별) |
 | `--phase3-api` | `hf` | `hf` = 로컬 LLM · `solar` = Solar Pro (`answer` 생성). `--llm-select` 문서 선별에도 동일 백엔드 적용 |
 | `--phase0-cache` | 없음 | 지정 CSV로 Phase 0 생략 (`artifacts/phase0_queries.csv` 등). **3축 RRF**를 쓰려면 CSV에 `alt_query` 열이 채워진 최신 파일 사용 |
+| `--rrf-weights` | 없음(균등 1,1,1) | Phase 1에서 standalone / HyDE / alt_query **다축 RRF 가중치** (쉼표로 3개). 예: `0.5,0.25,0.25`. 2축일 때는 존재하는 축에만 대응 |
 | `--llm-select` | 끔 | Phase 2.5 LLM 문서 선별 |
 | `--multi-field` | 끔 | F-2 메타 색인 후 BM25 멀티필드 검색 |
 | `--skip-dense` | 끔 | Dense 검색 생략(BM25만) |
