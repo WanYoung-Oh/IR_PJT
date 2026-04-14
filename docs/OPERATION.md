@@ -6,86 +6,122 @@
 
 ## 전체 파이프라인 흐름
 
+아래는 **`scripts/export_submission.py` → `run_pipeline()`** 기준입니다. 색인(ES/Qdrant)은 파이프라인 실행 전 **별도 1회** 완료된 상태라고 가정합니다.
+
 ```mermaid
 flowchart TD
     subgraph data ["데이터"]
-      D1["documents.jsonl<br>(4,272건)"]
-        D2["eval.jsonl<br>(220건: 단일200 / 멀티턴20)"]
+        D1["documents.jsonl → doc_map"]
+        D2["eval.jsonl"]
     end
 
-    subgraph index ["① 색인 (1회성)"]
-        PRE["문서 전처리<br>preprocess_science_doc()"]
-        IDX_ES["Elasticsearch 색인<br>Nori mixed + 사용자 사전<br>scripts/index_es.py"]
-        IDX_QD["Qdrant 벡터 색인<br>Qwen3-Embedding-8B<br>scripts/index_qdrant.py"]
-        DICT["사용자 사전 생성<br>MeCab → user_dict.txt<br>scripts/build_user_dict.py"]
+    subgraph idx_pre ["사전 색인 — 파이프라인 전에 1회"]
+        IDX_ES["index_es.py → ES"]
+        IDX_QD["index_qdrant.py → Qdrant"]
     end
 
-    subgraph query ["② 쿼리 전처리 (Phase 0)"]
-        CLASS["치챗/과학 분류<br>① 규칙 pre-filter → ② LLM<br>is_science_question()"]
-        QP["과학: 멀티 턴 재작성 + HyDE + alt_query<br>(로컬 LLM 또는 --phase0-api solar)<br>치챗: 원본 질문 그대로"]
-        P0SAVE["중간 저장<br>artifacts/phase0_queries.csv"]
+    subgraph p0 ["Phase 0"]
+        P0_fork{"분기"}
+        P0_cache["--phase0-cache CSV 복원"]
+        P0_skip["--skip-rewrite"]
+        P0_llm["_load_reasoning_llm"]
+        P0_work["is_science · 재작성 · HyDE · alt_query"]
+        P0_csv["phase0_queries.csv"]
+        P0_out["standalone_queries"]
     end
 
-    subgraph retrieval ["③ 하이브리드 검색 (Phase 1) — 과학만"]
-        BM25["BM25 검색<br>es_bm25_doc_ids()"]
-        DENSE["Dense 검색<br>qdrant_dense_doc_ids()"]
-        HYDE["HyDE doc + alt_query<br>(Phase 0에서 생성 · 저장)"]
-        RRF["RRF 병합 k=20<br>3축(원본+HyDE+alt) rrf_score()<br>→ Top-20"]
+    subgraph p1 ["Phase 1 Hybrid — 과학만"]
+        P1_emb{"--skip-dense?"}
+        P1_ed["임베딩 + BM25+Dense RRF"]
+        P1_bm["BM25만 RRF"]
+        P1_ax["1~3축 rrf_score"]
+        P1_top["candidate_ids top_k_retrieve"]
     end
 
-    subgraph rerank ["④ 재순위화 (Phase 2) — 과학만"]
-        RERANKER["Cross-Encoder<br>Qwen3-Reranker-8B<br>rerank_with_crossencoder()"]
-        VOTE["Soft Voting<br>Reranker 0.7 + RRF 0.3<br>soft_voting_rerank()<br>→ Top-20"]
+    subgraph p2 ["Phase 2 — 과학만"]
+        P2_r["rerank_with_crossencoder"]
+        P2_v["soft_voting_rerank → topk_ids"]
     end
 
-    subgraph gen ["⑤ 응답 생성 (Phase 3)"]
-        CTX["(과학) 컨텍스트 포맷<br>format_context()"]
-        LLM["(과학) CRAG / CoT 프롬프트<br>generate_answer()<br>(로컬 LLM 또는 --phase3-api solar)"]
-        CHECK["(과학) Faithfulness Self-check<br>RAGAS ≥ 0.7 — Google AI / OpenAI<br>generate_with_selfcheck()"]
-        CHAT["(치챗) 일상 대화 생성<br>generate_chitchat()"]
+    subgraph p25 ["Phase 2.5 선택"]
+        P25{"--llm-select?"}
+        P25_on["_llm_select_docs"]
+        P25_off["앞 N개 슬라이스"]
     end
 
-    subgraph output ["⑥ 제출"]
-        SUB["export_submission.py<br>--pipeline"]
-        VAL["validate_submission.py"]
-        CSV["sample_submission.csv<br>(eval_id / standalone_query<br>/ topk / answer / references)"]
+    subgraph p3 ["Phase 3"]
+        P3_fork{"--skip-generation?"}
+        P3_skip["placeholder 답변"]
+        P3_ans["generate_with_selfcheck / generate_chitchat"]
     end
 
-    subgraph eval ["⑦ 평가"]
-        MAP_LOCAL["로컬 MAP<br>run_retrieval_eval.py<br>(BM25 pseudo relevance)"]
-        MAP_COMP["대회 변형 MAP<br>run_competition_map.py<br>(GT 있을 때)"]
-        RAGAS_E["RAGAS 평가<br>ragas_eval.py<br>(Faithfulness/Relevancy/Recall)"]
+    subgraph out ["출력"]
+        WJ["write_jsonl"]
     end
 
-    D1 --> PRE --> IDX_ES & IDX_QD
-    D1 --> DICT --> IDX_ES
-    D2 --> CLASS --> QP --> P0SAVE
-    QP --> BM25 & DENSE & HYDE
-    IDX_ES --> BM25
-    IDX_QD --> DENSE
-    BM25 & DENSE & HYDE --> RRF
-    RRF --> RERANKER --> VOTE
-    VOTE --> CTX --> LLM --> CHECK
-    CLASS --> CHAT
-    CHECK & CHAT --> SUB --> VAL --> CSV
-    CSV --> MAP_COMP & RAGAS_E
-    IDX_ES --> MAP_LOCAL
+    subgraph eval_ext ["평가 별도 스크립트"]
+        E2["run_competition_map.py"]
+        E3["ragas_eval.py"]
+    end
+
+    D2 --> P0_fork
+    D1 -.->|doc_map| P2_r
+    IDX_ES -.-> P1_ed
+    IDX_ES -.-> P1_bm
+    IDX_QD -.-> P1_ed
+    P0_fork --> P0_cache --> P0_out
+    P0_fork --> P0_skip --> P0_out
+    P0_fork --> P0_llm --> P0_work --> P0_csv --> P0_out
+    P0_out --> P1_emb
+    P1_emb -->|embed+BM25| P1_ed --> P1_ax
+    P1_emb -->|BM25 only| P1_bm --> P1_ax
+    P1_top --> P2_r --> P2_v --> P25
+    P1_ax --> P1_top
+    P25 -->|on| P25_on --> P3_fork
+    P25 -->|off| P25_off --> P3_fork
+    P3_fork -->|yes| P3_skip --> WJ
+    P3_fork -->|no| P3_ans --> WJ
+    WJ -.-> E2
+    WJ -.-> E3
 ```
+
+**요약 (코드 순서)**
+
+| 단계 | 스크립트 상 이름 | 핵심 동작 |
+| --- | --- | --- |
+| Phase 0 | `run_pipeline` 앞부분 | 캐시 / `--skip-rewrite` / LLM 경로 분기 → 과학이면 standalone·HyDE·alt_query → `phase0_queries.csv` 조건부 저장 |
+| Phase 1 | Hybrid Retrieval | `--skip-dense`면 BM25만; 아니면 임베딩+BM25+Dense 가중 RRF. standalone·hyde·alt로 검색 축 1~3개 `rrf_score` |
+| Phase 2 | Reranking | `rerank_with_crossencoder` + `soft_voting_rerank` → `topk_ids` (기본 상위 10) |
+| Phase 2.5 | 선택 | `--llm-select`일 때만 `_llm_select_docs`; `--skip-generation`이면 비활성 |
+| Phase 3 | 생성 | `--skip-generation`이면 placeholder; 아니면 `_load_reasoning_llm(phase3_backend)`로 치챗·과학 답변 |
+
+**치챗**: Phase 1·2에서 검색·리랭킹 생략. Phase 3에서만 `generate_chitchat`.
 
 ---
 
 ## 클래스 다이어그램
 
+`scripts/export_submission.py`의 **`run_pipeline()`** 이 Phase 0~3을 순서대로 오케스트레이션할 때 의존하는 모듈 관계입니다. (색인 전용 `index_es.py` / `index_qdrant.py` 는 이 스크립트 밖에서 실행.)
+
 ```mermaid
 classDiagram
-    %% ── 데이터 모델 ───────────────────────────────────────────────────────────
+    %% ── 오케스트레이션 ───────────────────────────────────────────────────────
+    class export_submission {
+        <<script · run_pipeline>>
+        +run_pipeline(cfg, root, ...)
+        +_load_llm(cfg)
+        +_load_reasoning_llm(cfg, backend)
+        +_llm_select_docs(...)
+    }
+
+    %% ── 데이터 모델 ─────────────────────────────────────────────────────────
     class SubmissionRecord {
         <<dataclass>>
         +int eval_id
         +str standalone_query
         +list~str~ topk
         +str answer
-        +list~str~ references
+        +list~dict~ references
         +to_dict() dict
     }
 
@@ -94,24 +130,17 @@ classDiagram
         +complete(prompt: str) CompletionResponse
     }
 
-    %% ── 유틸리티 ──────────────────────────────────────────────────────────────
+    %% ── 공통 유틸 ─────────────────────────────────────────────────────────────
     class config {
         <<module>>
         +load_config(path) dict
-        +validate_config(cfg, required) None
-        +resolve_config_path(root, arg) Path
         +repo_root_from(start) Path
     }
 
     class io_util {
         <<module>>
-        +iter_jsonl(path) Iterator~dict~
+        +iter_jsonl(path)
         +write_jsonl(path, rows) None
-    }
-
-    class preprocess {
-        <<module>>
-        +preprocess_science_doc(text) str
     }
 
     class vram {
@@ -124,141 +153,88 @@ classDiagram
         +validate_submission_row(row) None
     }
 
-    %% ── Phase 0: 쿼리 전처리 ─────────────────────────────────────────────────
+    %% ── Phase 0 ─────────────────────────────────────────────────────────────
     class query_rewrite {
-        <<module · Phase 0>>
+        <<module>>
         +is_science_question(msg, llm) bool
         +build_search_query(msg, llm) str
         +generate_alt_query(query, llm) str
-        -_SCIENCE_PREFILTER_RE : Pattern
-        -_is_valid_query(query, original) bool
-        -_strip_think(text) str
     }
 
     class llm_openai_chat {
-        <<module · API 브릿지>>
-        +OpenAIChatCompletionLLM.complete(prompt) CompletionResponse
-        -Solar Pro 등 OpenAI 호환 Chat Completions
-    }
-
-    %% ── Phase 1: 색인 / 하이브리드 검색 ──────────────────────────────────────
-    class es_util {
-        <<module · Phase 1>>
-        +KOREAN_SYNONYMS : list~str~
-        +ensure_index(es, index, recreate, user_dict_rules) None
-        -_build_settings(user_dict_rules) dict
-    }
-
-    class embeddings {
-        <<module · Phase 1>>
-        +build_huggingface_embedding(cfg) HuggingFaceEmbedding
-        +embedding_model_kwargs() dict
+        <<module>>
+        +OpenAIChatCompletionLLM.complete()
     }
 
     class retrieval {
-        <<module · Phase 1>>
-        +es_bm25_doc_ids(es, index, query, top_k) list~str~
-        +qdrant_dense_doc_ids(client, collection, embed_fn, query, top_k) list~str~
-        +rrf_score(rankings, k=20) dict
-        +generate_hyde_doc(query, llm) str
-        -es_bm25_top_score(es, index, query) float
+        <<module ir_rag.retrieval>>
+        +es_bm25_doc_ids(...)
+        +qdrant_dense_doc_ids(...)
+        +rrf_score(rankings, k, weights)
+        +build_uuid_to_docid(path)
+        +generate_hyde_doc(query, llm)
     }
 
-    %% ── Phase 2: 재순위화 ─────────────────────────────────────────────────────
+    class embeddings {
+        <<module>>
+        +build_huggingface_embedding(cfg)
+    }
+
+    %% ── Phase 2 ───────────────────────────────────────────────────────────────
     class reranker {
-        <<module · Phase 2>>
-        +load_reranker(model_name) AutoModel
-        +rerank_with_crossencoder(model, tokenizer, query, doc_ids, doc_map, top_n) list~str~
-        +soft_voting_rerank(rrf_scores, reranker_scores, w_reranker) dict
-        -_minmax_normalize(values) ndarray
+        <<module>>
+        +load_reranker(model_name) tuple
+        +rerank_with_crossencoder(...) dict
+        +soft_voting_rerank(rrf, rerank, w) dict
     }
 
-    %% ── Phase 3: 응답 생성 ────────────────────────────────────────────────────
+    %% ── Phase 3 ───────────────────────────────────────────────────────────────
     class generator {
-        <<module · Phase 3>>
+        <<module>>
         +format_context(doc_ids, doc_map, top_k) str
-        +generate_answer(question, context, llm, use_crag) str
         +generate_chitchat(question, llm) str
-        +generate_with_selfcheck(question, context, llm, threshold, max_retries) str
-        -_build_ragas_llm() LangchainLLMWrapper
-        -_eval_faithfulness(question, answer, context) float
-    }
-
-    %% ── 평가 ──────────────────────────────────────────────────────────────────
-    class eval_map {
-        <<module · 평가>>
-        +build_relevance_bm25(eval_path, es_client, llm, top_k) dict
-        +evaluate_map(relevance, results) float
-    }
-
-    class pseudo_label {
-        <<module · 평가>>
-        +build_relevance_pseudo(eval_path, doc_path, embed_model, llm, top_k) dict
-    }
-
-    class competition_metrics {
-        <<module · 평가>>
-        +calc_map(submission_rows, gt) float
-        +load_gt_jsonl(path) dict
-        +load_submission_rows(path) list
+        +generate_with_selfcheck(q, ctx, llm) str
+        -_eval_faithfulness RAGAS
     }
 
     %% ── 외부 시스템 ───────────────────────────────────────────────────────────
     class Elasticsearch {
         <<external>>
-        BM25 + Nori 형태소 분석
+        BM25 Nori
     }
 
     class Qdrant {
         <<external>>
-        HNSW 벡터 검색
-    }
-
-    class GoogleAI {
-        <<external>>
-        gemini-2.0-flash
-        text-embedding-004
-    }
-
-    class OpenAI {
-        <<external>>
-        RAGAS 기본 평가자
+        HNSW
     }
 
     class RAGAS {
         <<external>>
-        faithfulness
-        answer_relevancy
-        context_recall
+        faithfulness self-check
     }
 
-    %% ── 관계 ──────────────────────────────────────────────────────────────────
-    submission "1" *-- "1" SubmissionRecord : contains
+    %% ── 관계: export_submission 중심 ───────────────────────────────────────────
+    export_submission ..> config : load_config
+    export_submission ..> query_rewrite : Phase0
+    export_submission ..> retrieval : Phase0 HyDE Phase1 RRF
+    export_submission ..> embeddings : Phase1
+    export_submission ..> reranker : Phase2
+    export_submission ..> generator : Phase3
+    export_submission ..> llm_openai_chat : solar API
+    export_submission ..> io_util : write_jsonl
+    export_submission ..> submission : validate
+    export_submission ..> vram : unload
+    export_submission ..> SubmissionRecord : 행 생성
 
-    query_rewrite ..> _LLMComplete        : uses (Protocol)
-    llm_openai_chat ..> _LLMComplete      : solar API 브릿지
-    retrieval      ..> _LLMComplete        : uses (HyDE)
-    generator      ..> _LLMComplete        : uses
-
-    es_util    ..> Elasticsearch : 인덱스 생성
-    retrieval  ..> Elasticsearch : BM25 검색
-    retrieval  ..> Qdrant        : Dense 검색
-    retrieval  ..> query_rewrite : build_search_query (HyDE)
-
-    reranker   ..> retrieval     : Top-100 입력
-    vram       ..> embeddings    : Phase 1 종료 후 언로드
-    vram       ..> reranker      : Phase 2 종료 후 언로드
-
-    generator  ..> RAGAS         : faithfulness 평가
-    RAGAS      ..> GoogleAI      : LLM 평가자 (우선)
-    RAGAS      ..> OpenAI        : LLM 평가자 (대안)
-
-    eval_map      ..> query_rewrite : build_search_query
-    eval_map      ..> io_util       : iter_jsonl
-    pseudo_label  ..> query_rewrite : build_search_query
-    pseudo_label  ..> io_util       : iter_jsonl
-    pseudo_label  ..> embeddings    : 유사도 계산
+    query_rewrite ..> _LLMComplete
+    llm_openai_chat ..> _LLMComplete
+    retrieval ..> _LLMComplete : HyDE
+    generator ..> _LLMComplete
+    retrieval ..> Elasticsearch : BM25
+    retrieval ..> Qdrant : Dense
+    generator ..> RAGAS : self-check
 ```
+
 
 ---
 
