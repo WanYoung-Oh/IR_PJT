@@ -2,6 +2,8 @@
 
 > **현재 목표**: MAP 0.85+ 달성 (베이스라인 0.6682 → 참조 팀 0.9288)
 > 검색 품질 개선 → LLM 품질 개선 순으로 진행한다.
+>
+> **갱신 (2026-04-14)**: G-1(`--llm-select`) 리더보드 제출 **MAP=MRR=0.8795** — 목표 0.85+ 달성. B-3b(Reranker QLoRA) 단독 제출 **MAP=MRR=0.2439** (기대 대비 저조; 추론·데이터 점검 대상).
 
 ---
 
@@ -14,15 +16,15 @@
 | **문서 메타 정보** | LLM으로 제목·키워드·요약·카테고리 생성 후 색인 | 원본 content 필드만 색인 |
 | **ES 유사도 알고리즘** | LMJelinekMercer | 기본 BM25 (TF-IDF 계열) |
 | **ES 동의어 사전** | 사용자 정의 동의어 적용 | 없음 |
-| **Reranker Fine-tuning** | 도메인 파인튜닝 완료 | 기본 Qwen3-Reranker-8B (미파인튜닝) |
-| **LLM 최종 선별** | Reranker 이후 LLM 프롬프트로 최적 문서 재선택 | Reranker 점수로만 결정 |
+| **Reranker Fine-tuning** | 도메인 파인튜닝 완료 | QLoRA 시도(B-3b) — 리더보드 단독 **0.2439** (저조) |
+| **LLM 최종 선별** | Reranker 이후 LLM 프롬프트로 최적 문서 재선택 | G-1(`--llm-select`) 적용 — 리더보드 **MAP=MRR=0.8795** |
 
 > **청킹 미적용 결정**: 우리 문서의 content 평균 315자 / 최대 1,230자로 이미 패시지 크기.
 > 청킹 시 문맥 절단으로 Reranker 정확도 저하 위험이 높아 제외.
 
 ---
 
-## 진행 현황 (2026-04-13 기준)
+## 진행 현황 (2026-04-14 갱신)
 
 | Phase  | 항목                                           | 상태           | 결과                                                               |
 | ------ | ---------------------------------------------- | -------------- | ------------------------------------------------------------------ |
@@ -38,9 +40,9 @@
 | F-1    | 문서 메타 정보 생성                            | ✅ 완료        | 4,272건 생성 → `artifacts/doc_metadata.jsonl` (2.1MB)              |
 | F-2a   | 과학 동의어 사전 생성                          | ✅ 완료        | 233개 규칙 → `artifacts/science_synonyms.txt`                      |
 | F-2b   | ES 재인덱싱 (LMJelinekMercer + 동의어 + 메타) | ✅ 완료        | 사용자사전 750개 + 동의어 233개 + 멀티필드 + LMJelinekMercer 적용  |
-| G-1    | LLM 최종 문서 선별 (Phase 2.5)                 | 🔧 구현 완료   | `export_submission.py --llm-select` 플래그로 활성화                |
+| G-1    | LLM 최종 문서 선별 (Phase 2.5)                 | ✅ 완료        | 리더보드 **MAP=MRR=0.8795** (`export_submission.py --llm-select`)  |
 | B-3a   | Reranker 트리플렛 생성                         | ✅ 완료        | 1,747건 → `artifacts/reranker_triplets.jsonl`                      |
-| B-3b   | Reranker Fine-tuning                           | 🔄 진행 중     | Qwen3-Reranker-8B QLoRA, 1968 steps / 3 epoch, 약 5~6시간 소요     |
+| B-3b   | Reranker Fine-tuning                           | ✅ 완료        | QLoRA 1968 steps / 3 epoch — 리더보드 **MAP=MRR=0.2439** (기대 대비 저조; 점검 대상) |
 
 ### 주요 이슈 해결 기록
 
@@ -58,6 +60,8 @@
 | 2 | Hybrid(BM25+Dense 균등) + alt_query + Reranker + 4B SFT | **0.3364** | 0.3379 | Dense 노이즈 + `<think>` 오염 |
 | 3 | BM25 단독(--skip-dense) + Reranker + 4B SFT | **0.4364** | 0.4379 | HyDE 미사용으로 베이스라인 미달 |
 | E-1 | BM25+Dense 7:3 + HyDE 2축 + Reranker + 9B | **0.3864** | 0.3879 | Dense 7:3에서도 오염 지속 |
+| B-3b | 파인튜닝 Reranker(QLoRA) 적용 제출 | **0.2439** | 0.2439 | Reranker만 교체; 기대 대비 저조 |
+| G-1 | `--llm-select` LLM 최종 문서 선별 | **0.8795** | 0.8795 | 목표 0.85+ 달성 |
 
 ### Dense 오염 패턴 분석
 
@@ -127,7 +131,7 @@ python scripts/export_submission.py \
 | 실험 | 설명 | 조건 |
 |---|---|---|
 | F-1→F-2 | 메타 색인 + LMJelinekMercer + 동의어 | E-5 MAP ≥ 0.60 이면 착수 |
-| G-1 | LLM 최종 문서 선별 (--llm-select) | F-2 완료 후 또는 E-5 직후 단독 테스트 |
+| G-1 | LLM 최종 문서 선별 (--llm-select) | ✅ 완료 — MAP=MRR=0.8795 (2026-04-14) |
 | Dense 재인덱싱 | Qdrant 인덱스 재구축 후 재실험 | 원인 파악 후 별도 검토 |
 
 ---
@@ -230,6 +234,10 @@ python scripts/export_submission.py \
 
 ## Phase G — LLM 최종 문서 선별 (Phase 2.5)
 
+#### G-1 결과 (2026-04-14)
+
+리더보드 **MAP=MRR=0.8795** — 상단 목표(0.85+) 달성.
+
 **현재**: Reranker top-10 → 답변 생성 (수치 점수만으로 결정)
 **개선**: Reranker top-10 → **LLM 선별 top-3** → 답변 생성
 
@@ -298,6 +306,10 @@ sft_doc_qa.jsonl 각 행 →
 배치: per_device=2, grad_accum=8 → 유효 배치 16
 ```
 
+#### B-3b 리더보드 결과 (2026-04-14)
+
+QLoRA 파인튜닝 Reranker(`artifacts/qwen3-reranker-8b-science`) 적용 제출: **MAP=MRR=0.2439** — 기대 대비 매우 낮음. 트리플렛·음성 샘플링·도메인 불일치 및 추론 시 PEFT 어댑터 로드 여부(`load_reranker`) 등 추가 분석 예정.
+
 ### 실행 명령
 
 ```bash
@@ -365,11 +377,11 @@ python scripts/run_competition_map.py \
 | 7    | F-2a   | `build_synonyms.py`                                   | ✅ 완료        | 동의어 233개 규칙 → `science_synonyms.txt`    |
 | 8    | F-2b   | `index_es.py --lm-jelinek-mercer --recreate`          | ✅ 완료        | LMJelinekMercer + 동의어 + 멀티필드 적용      |
 | 9    | B-3a   | `build_reranker_triplets.py`                          | ✅ 완료        | 1,747건 트리플렛 → `reranker_triplets.jsonl`  |
-| 10   | B-3b   | `train_reranker.py`                                   | 🔄 진행 중     | QLoRA 학습 중 (1968 steps / 3 epoch, ~5~6시간)|
-| 11   | G-1    | `export_submission.py --llm-select`                   | 🔧 구현 완료   | B-3b 완료 후 또는 E-5 병행 실험               |
+| 10   | B-3b   | `train_reranker.py`                                   | ✅ 완료        | 리더보드 MAP=MRR=0.2439 — Reranker 단독 교체 제출                |
+| 11   | G-1    | `export_submission.py --llm-select`                   | ✅ 완료        | 리더보드 MAP=MRR=0.8795 — 목표 0.85+ 달성                     |
 | 12   | D      | `serve_app.py` + `static/index.html`                  | ⬜ 미시작      | 서빙 UI — 전체 검증 완료 후                   |
 
-> **현재 우선순위**: B-3b 학습 완료 대기 중. 그 사이 E-5(BM25-only + HyDE) 실험으로 베이스라인 회복 확인 권장.
+> **현재 우선순위**: G-1으로 MAP 0.85+ 달성. B-3b 단독(0.2439)은 저조 — Reranker 추론 경로·데이터 점검. E-5(BM25-only + HyDE)는 선택적으로 베이스라인 회복 비교용.
 
 ---
 

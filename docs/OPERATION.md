@@ -22,7 +22,7 @@ flowchart TD
 
     subgraph query ["② 쿼리 전처리 (Phase 0)"]
         CLASS["치챗/과학 분류<br>① 규칙 pre-filter → ② LLM<br>is_science_question()"]
-        QP["과학: 멀티 턴 LLM 재작성<br>+ HyDE doc · alt_query 생성<br>치챗: 원본 질문 그대로"]
+        QP["과학: 멀티 턴 재작성 + HyDE + alt_query<br>(로컬 LLM 또는 --phase0-api solar)<br>치챗: 원본 질문 그대로"]
         P0SAVE["중간 저장<br>artifacts/phase0_queries.csv"]
     end
 
@@ -40,7 +40,7 @@ flowchart TD
 
     subgraph gen ["⑤ 응답 생성 (Phase 3)"]
         CTX["(과학) 컨텍스트 포맷<br>format_context()"]
-        LLM["(과학) CRAG / CoT 프롬프트<br>generate_answer()"]
+        LLM["(과학) CRAG / CoT 프롬프트<br>generate_answer()<br>(로컬 LLM 또는 --phase3-api solar)"]
         CHECK["(과학) Faithfulness Self-check<br>RAGAS ≥ 0.7 — Google AI / OpenAI<br>generate_with_selfcheck()"]
         CHAT["(치챗) 일상 대화 생성<br>generate_chitchat()"]
     end
@@ -129,9 +129,16 @@ classDiagram
         <<module · Phase 0>>
         +is_science_question(msg, llm) bool
         +build_search_query(msg, llm) str
+        +generate_alt_query(query, llm) str
         -_SCIENCE_PREFILTER_RE : Pattern
         -_is_valid_query(query, original) bool
         -_strip_think(text) str
+    }
+
+    class llm_openai_chat {
+        <<module · API 브릿지>>
+        +OpenAIChatCompletionLLM.complete(prompt) CompletionResponse
+        -Solar Pro 등 OpenAI 호환 Chat Completions
     }
 
     %% ── Phase 1: 색인 / 하이브리드 검색 ──────────────────────────────────────
@@ -229,6 +236,7 @@ classDiagram
     submission "1" *-- "1" SubmissionRecord : contains
 
     query_rewrite ..> _LLMComplete        : uses (Protocol)
+    llm_openai_chat ..> _LLMComplete      : solar API 브릿지
     retrieval      ..> _LLMComplete        : uses (HyDE)
     generator      ..> _LLMComplete        : uses
 
@@ -279,7 +287,8 @@ OPENAI_API_KEY=sk-...
 # 둘 다 없거나 Self-check를 완전히 끄려면:
 # DISABLE_SELFCHECK=1
 
-# SFT 데이터 답변 생성용 (build_sft_data.py --answer-api solar)
+# Upstage Solar Pro — SFT 답변 생성(build_sft_data) · 제출 파이프라인 Phase0/3 API 모드
+#   export_submission.py --phase0-api solar --phase3-api solar
 SOLAR_API_KEY=up_...
 
 HF_TOKEN=hf_...       # HuggingFace private 모델 접근 시 필요
@@ -420,6 +429,16 @@ python scripts/index_qdrant.py --config config/default.yaml --force
 
 ```bash
 python scripts/smoke_e2e.py --config config/default.yaml
+```
+
+### 5-1b. Elasticsearch + Qdrant 색인 점검
+
+`documents.jsonl` 건수와 ES 인덱스·Qdrant 컬렉션의 문서(포인트) 수가 일치하는지, 샘플 검색이 되는지 확인합니다.
+
+```bash
+python scripts/verify_indices.py --config config/default.yaml
+# Dense 벡터 검색까지 시험하려면 GPU 부하 있음:
+# python scripts/verify_indices.py --config config/default.yaml --probe-dense
 ```
 
 ### 5-2. BM25 Pseudo MAP (상대 비교용)
@@ -573,14 +592,34 @@ python scripts/export_submission.py \
   --top-k-rerank 10
 ```
 
+**Phase 0·3을 Solar Pro API만 사용** (로컬 HuggingFace LLM 미로드 — `SOLAR_API_KEY` 필요, `requirements-train.txt`의 `openai` 패키지 사용):
+
+```bash
+python scripts/export_submission.py \
+  --pipeline \
+  --config config/default.yaml \
+  --phase0-api solar \
+  --phase3-api solar
+```
+
+| 옵션 | 기본값 | 설명 |
+| --- | --- | --- |
+| `--phase0-api` | `hf` | `hf` = `config`의 로컬 LLM · `solar` = Solar Pro (standalone·HyDE·alt_query·과학 판별) |
+| `--phase3-api` | `hf` | `hf` = 로컬 LLM · `solar` = Solar Pro (`answer` 생성). `--llm-select` 문서 선별에도 동일 백엔드 적용 |
+| `--phase0-cache` | 없음 | 지정 CSV로 Phase 0 생략 (`artifacts/phase0_queries.csv` 등). **3축 RRF**를 쓰려면 CSV에 `alt_query` 열이 채워진 최신 파일 사용 |
+| `--llm-select` | 끔 | Phase 2.5 LLM 문서 선별 |
+| `--multi-field` | 끔 | F-2 메타 색인 후 BM25 멀티필드 검색 |
+| `--skip-dense` | 끔 | Dense 검색 생략(BM25만) |
+| `--skip-generation` | 끔 | Phase 3 답변 생략(검색 실험용) |
+
 **4-Phase 순차 로드 (VRAM 관리)**:
 
-| Phase | 모델         | 작업                                                                    | 대상   | VRAM  |
-| ----- | ------------ | ----------------------------------------------------------------------- | ------ | ----- |
-| 0     | LLM 4B       | 치챗/과학 분류(규칙→LLM) + 쿼리 재작성 + HyDE·alt_query 생성 → CSV 저장 | 전체   | ~8GB  |
+| Phase | 모델 / 백엔드 | 작업                                                                    | 대상   | VRAM / 비고 |
+| ----- | ------------- | ----------------------------------------------------------------------- | ------ | ----- |
+| 0     | 로컬 LLM 또는 **Solar API** | 치챗/과학 분류 + 쿼리 재작성 + HyDE + **alt_query** → `phase0_queries.csv` | 전체   | 로컬 시 ~8GB · API 시 GPU 없음 |
 | 1     | Embedding 8B | BM25 + Dense → 3축 RRF(k=20) Top-20                                     | 과학만 | ~16GB |
 | 2     | Reranker 8B  | Cross-Encoder + Soft Voting → Top-N                                     | 과학만 | ~16GB |
-| 3     | LLM 4B       | CRAG + Self-check (과학) / 일상 대화 (치챗)                             | 전체   | ~8GB  |
+| 3     | 로컬 LLM 또는 **Solar API** | CRAG + Self-check (과학) / 일상 대화 (치챗)                             | 전체   | 로컬 시 ~8GB · API 시 GPU 없음 |
 
 각 Phase 종료 후 모델을 GPU에서 언로드(`vram.unload_model`)하여 다음 Phase를 위한 VRAM을 확보합니다.
 
@@ -687,7 +726,8 @@ python -m pytest tests/ --cov=ir_rag --cov-report=term-missing
 | `embedding`     | `model_name`, `trust_remote_code`            |
 | `reranker`      | `model_name` (4B ↔ 8B 전환)                  |
 | `vllm`          | `url`, `model_name` (서버 기동 후 주석 해제) |
-| `llm`           | `model_name`, `max_new_tokens`               |
+| `llm`           | `model_name`, `checkpoint`, `max_new_tokens`   |
+| (CLI)           | Phase 0·3 API 모드: `export_submission.py --phase0-api solar --phase3-api solar` — `.env`에 `SOLAR_API_KEY` |
 
 ---
 
@@ -708,7 +748,8 @@ ES + Qdrant 색인이 완료된 상태에서 결과를 개선하거나 처음부
                                                                                │
   Step 1. 전체 파이프라인 실행                                                  │
   python scripts/export_submission.py --pipeline                               │
-      → artifacts/phase0_queries.csv  (Phase 0 분류·재작성 결과)               │
+      # Phase 0·3 API: --phase0-api solar --phase3-api solar                  │
+      → artifacts/phase0_queries.csv  (Phase 0 분류·재작성·HyDE·alt_query)     │
       → artifacts/sample_submission.csv  (최종 제출 파일 초안)                  │
                           │                                                    │
   Step 2. 제출 파일 후처리                                                      │

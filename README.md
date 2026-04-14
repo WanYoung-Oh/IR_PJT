@@ -30,10 +30,10 @@ flowchart LR
     end
 
     subgraph pipeline ["② ~ ⑤ 파이프라인 (4-Phase 순차 로드)"]
-        QP["Phase 0: 쿼리 재작성<br>LLM 4B (멀티턴만)"]
-        RET["Phase 1: Hybrid Retrieval<br>Embedding 8B + BM25<br>→ RRF(k=60) Top-20"]
+        QP["Phase 0: 쿼리 재작성<br>로컬 LLM 또는 Solar Pro<br>standalone·HyDE·alt_query"]
+        RET["Phase 1: Hybrid Retrieval<br>Embedding 8B + BM25<br>→ RRF Top-20"]
         RNK["Phase 2: Reranking<br>Qwen3-Reranker-8B<br>+ Soft Voting → Top-10"]
-        GEN["Phase 3: 응답 생성<br>LLM 4B · CRAG + Self-check"]
+        GEN["Phase 3: 응답 생성<br>로컬 LLM 또는 Solar Pro<br>CRAG + Self-check"]
     end
 
     subgraph out ["⑥ 출력"]
@@ -54,7 +54,7 @@ IR/
 ├── README.md
 ├── pyproject.toml              ← 패키지 메타데이터 (pytest pythonpath 포함)
 ├── .python-version             ← Python 3.10.x 권장
-├── .env.example                ← 시크릿 템플릿 (ES_PASSWORD, GOOGLE_API_KEY, OPENAI_API_KEY)
+├── .env.example                ← 시크릿 템플릿 (ES_PASSWORD, HF_TOKEN, SOLAR_API_KEY 등)
 ├── .gitignore
 ├── requirements-train.txt      ← RAG 코어 + SFT 학습 (기본 venv)
 ├── requirements-vllm.txt       ← vLLM 서빙 전용 (별도 venv 필수)
@@ -85,7 +85,8 @@ IR/
 │   ├── build_sft_data.py       ← eval+docs → Unsloth SFT 포맷
 │   ├── train_sft.py            ← Unsloth QLoRA/bf16 LoRA + GGUF 내보내기
 │   ├── serve_vllm.py           ← vLLM OpenAI 호환 API 서버
-│   ├── export_submission.py    ← 제출 파일 생성 [--placeholder | --pipeline]
+│   ├── export_submission.py    ← 제출 파일 생성 [--placeholder | --pipeline | --phase0-api solar …]
+│   ├── verify_indices.py       ← ES·Qdrant 색인 건수·샘플 검색 점검
 │   ├── validate_submission.py  ← 제출 행 필수 키 검사
 │   ├── run_retrieval_eval.py   ← BM25 pseudo MAP (로컬 상대 비교)
 │   ├── run_competition_map.py  ← 대회 변형 MAP (GT + 제출본)
@@ -96,7 +97,8 @@ IR/
 │   ├── config.py               ← load_config · validate_config · resolve_config_path
 │   ├── io_util.py              ← iter_jsonl · write_jsonl
 │   ├── preprocess.py           ← preprocess_science_doc (LaTeX·참고문헌 제거)
-│   ├── query_rewrite.py        ← build_search_query (멀티턴 LLM 재작성)
+│   ├── query_rewrite.py        ← build_search_query · generate_alt_query · is_science_question
+│   ├── llm_openai_chat.py      ← Solar Pro 등 OpenAI 호환 API → complete() 브릿지
 │   ├── embeddings.py           ← build_huggingface_embedding (flash_attn/sdpa)
 │   ├── es_util.py              ← ensure_index (Nori·user_dict 설정)
 │   ├── retrieval.py            ← BM25 · Dense(Qdrant) · RRF · HyDE
@@ -143,10 +145,15 @@ python scripts/index_qdrant.py --config config/default.yaml   # GPU 필요
 
 # 5. 동작 확인
 python scripts/smoke_e2e.py --config config/default.yaml
+python scripts/verify_indices.py --config config/default.yaml   # ES·Qdrant 색인 점검
 python -m pytest tests/ -v
 
-# 6. 실제 파이프라인 제출 (GPU + 모델 필요)
+# 6. 실제 파이프라인 제출 (GPU: 임베딩·Reranker·로컬 LLM 시 필요)
 python scripts/export_submission.py --pipeline --config config/default.yaml
+
+# Phase 0·3만 Solar Pro API (로컬 생성 LLM 미사용 — SOLAR_API_KEY, openai 패키지)
+python scripts/export_submission.py --pipeline --config config/default.yaml \
+  --phase0-api solar --phase3-api solar
 
 # Phase 1~3만 빠르게 점검 (쿼리 재작성 생략)
 python scripts/export_submission.py --pipeline --skip-rewrite \
@@ -166,6 +173,8 @@ python scripts/validate_submission.py artifacts/sample_submission.csv
 | 문서 전처리                       | `preprocess.py`                                  | ✅                   |
 | 치챗/과학 분류                    | `query_rewrite.is_science_question`              | ✅                   |
 | 쿼리 재작성 (멀티턴)              | `query_rewrite.build_search_query`               | ✅                   |
+| alt_query (3축 RRF)             | `query_rewrite.generate_alt_query`               | ✅                   |
+| Solar Pro / OpenAI Chat 브릿지    | `llm_openai_chat.OpenAIChatCompletionLLM`      | ✅ (`export_submission --phase*-api solar`) |
 | ES 색인 (Nori + 사용자 사전)      | `es_util.py`, `scripts/index_es.py`              | ✅                   |
 | Qdrant 벡터 색인                  | `embeddings.py`, `scripts/index_qdrant.py`       | ✅                   |
 | BM25 검색                         | `retrieval.es_bm25_doc_ids`                      | ✅                   |
@@ -212,6 +221,9 @@ A. 네, 220건 중 약 20건이 과학과 무관한 일상 대화입니다. Phas
 
 **Q. RAGAS Self-check에 어떤 API 키가 필요한가요?**  
 A. `GOOGLE_API_KEY`(Google AI Studio) 또는 `OPENAI_API_KEY` 중 하나를 `.env`에 설정하면 됩니다. `GOOGLE_API_KEY`가 있으면 **Gemini 2.0 Flash**가 우선 사용됩니다 (무료 티어 제공). OpenAI 쿼터 초과 시에도 Google AI Studio로 대체하거나, 둘 다 없을 때는 `.env`에 `DISABLE_SELFCHECK=1`을 추가해 Self-check를 비활성화합니다.
+
+**Q. Phase 0·최종 답변을 Solar Pro API만 쓰고 싶어요.**  
+A. `export_submission.py`에 `--phase0-api solar --phase3-api solar`를 지정합니다. `.env`에 `SOLAR_API_KEY`가 필요합니다(Upstage). Phase 1(임베딩)·Phase 2(Reranker)는 기존과 같이 GPU·로컬 모델을 사용합니다. 자세한 옵션은 `docs/OPERATION.md` 8절을 참고하세요.
 
 **Q. 변형 MAP이 뭔가요?**  
 A. 리더보드 채점은 `topk` 상위 3개 docid와 정답 set의 AP를 평균냅니다. GT가 빈 케이스(검색 불필요)는 `topk`가 비어 있으면 만점(1), 아니면 0점입니다.

@@ -196,3 +196,23 @@ def build_search_query(msg: list[dict], llm: _LLMComplete | None = None) -> str:
 
     context = " ".join(m["content"] for m in msg[:-1])
     return f"{context} {original}"
+
+
+def generate_alt_query(query: str, llm: _LLMComplete) -> str:
+    """과학 질문을 다른 표현으로 재작성한다 (BM25 RRF 3축용 alt_query).
+
+    Parameters
+    ----------
+    query:
+        standalone 검색 쿼리.
+    llm:
+        ``llm.complete(prompt).text`` 인터페이스를 가진 LLM.
+    """
+    fusion_prompt = (
+        "다음 과학 질문을 다른 표현으로 재작성하세요 (1개만).\n"
+        f"질문: {query}\n재작성:"
+    )
+    raw = llm.complete(fusion_prompt).text
+    cleaned = _strip_think(raw)
+    line = cleaned.split("\n")[0].strip()
+    return line

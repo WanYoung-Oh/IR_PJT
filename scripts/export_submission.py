@@ -13,6 +13,10 @@
 
     # 실제 파이프라인 실행
     python scripts/export_submission.py --pipeline --config config/default.yaml
+
+    # Phase 0·3 을 Solar Pro API만 사용 (로컬 LLM 미사용, SOLAR_API_KEY 필요)
+    python scripts/export_submission.py --pipeline --config config/default.yaml \\
+      --phase0-api solar --phase3-api solar
 """
 from __future__ import annotations
 
@@ -31,7 +35,8 @@ load_dotenv(ROOT / ".env")
 from ir_rag.config import load_config, repo_root_from, resolve_config_path
 from ir_rag.generator import format_context, generate_chitchat, generate_with_selfcheck
 from ir_rag.io_util import iter_jsonl, write_jsonl
-from ir_rag.query_rewrite import build_search_query, is_science_question
+from ir_rag.llm_openai_chat import OpenAIChatCompletionLLM
+from ir_rag.query_rewrite import build_search_query, generate_alt_query, is_science_question
 from ir_rag.reranker import load_reranker, rerank_with_crossencoder, soft_voting_rerank
 from ir_rag.retrieval import es_bm25_doc_ids, generate_hyde_doc, qdrant_dense_doc_ids, rrf_score
 from ir_rag.submission import SubmissionRecord, validate_submission_row
@@ -100,6 +105,14 @@ def _llm_select_docs(
     return valid_ids[:top_k]
 
 
+def _load_reasoning_llm(cfg: dict, backend: str):
+    """Phase 0 / 2.5 / 3 공통: 로컬 HF 또는 Solar Pro API."""
+    if backend == "solar":
+        print("LLM: Solar Pro API — OpenAI 호환 (https://api.upstage.ai/v1)")
+        return OpenAIChatCompletionLLM(api="solar", model="solar-pro")
+    return _load_llm(cfg)
+
+
 def run_pipeline(
     cfg: dict,
     root: Path,
@@ -114,6 +127,8 @@ def run_pipeline(
     llm_select: bool = False,
     use_multi_field: bool = False,
     skip_generation: bool = False,
+    phase0_backend: str = "hf",
+    phase3_backend: str = "hf",
 ) -> list[dict]:
     """전체 RAG 파이프라인을 실행하여 제출 행 목록을 반환한다.
 
@@ -139,6 +154,12 @@ def run_pipeline(
     use_multi_field:
         True 이면 BM25 검색 시 title/keywords/summary/content 멀티필드 쿼리를 사용한다.
         F-2 메타 색인 완료 후 활성화한다.
+    phase0_backend:
+        ``"hf"`` (기본) 로컬 HuggingFace LLM, ``"solar"`` Solar Pro API
+        (standalone / HyDE / alt_query / 과학 판별).
+    phase3_backend:
+        ``"hf"`` (기본) 로컬 LLM, ``"solar"`` Solar Pro API (answer 생성 및
+        ``--llm-select`` 시 문서 선별).
     """
     from elasticsearch import Elasticsearch
     from qdrant_client import QdrantClient
@@ -192,9 +213,12 @@ def run_pipeline(
                 "hyde_doc": "", "alt_query": "",   # skip_rewrite 시 HyDE 없이 1축 동작
             })
     else:
-        print("=== Phase 0: Query Rewriting ===")
+        if phase0_backend == "solar":
+            print("=== Phase 0: Query Rewriting (Solar Pro API) ===")
+        else:
+            print("=== Phase 0: Query Rewriting ===")
         print("LLM 로드 중 (쿼리 재작성용) …")
-        llm = _load_llm(cfg)
+        llm = _load_reasoning_llm(cfg, phase0_backend)
 
         for sample in samples:
             eid = int(sample["eval_id"])
@@ -207,18 +231,23 @@ def run_pipeline(
             else:
                 standalone = user_msgs[-1]["content"] if user_msgs else ""
 
-            # 과학 쿼리에 HyDE 문서 생성 (3축 BM25 RRF 활성화)
+            # 과학 쿼리에 HyDE 문서 + alt_query 생성 (3축 BM25 RRF 활성화)
             # <think> 태그는 strip 후 사용 (버리지 않음)
             hyde_doc = ""
+            alt_query = ""
             if science and standalone:
                 raw_hyde = generate_hyde_doc(standalone, llm)
                 import re as _re
-                hyde_doc = _re.sub(r"<think>.*?</think>", "", raw_hyde, flags=_re.DOTALL).strip()
+                hyde_doc = _re.sub(r"<redacted_thinking>.*?</redacted_thinking>", "", raw_hyde, flags=_re.DOTALL).strip()
+                try:
+                    alt_query = generate_alt_query(standalone, llm)
+                except Exception as e:
+                    print(f"  [경고] alt_query 생성 실패 (eval_id={eid}): {e}")
 
             standalone_queries.append({
                 "eid": eid, "msg": msg, "standalone": standalone,
                 "is_science": science,
-                "hyde_doc": hyde_doc, "alt_query": "",
+                "hyde_doc": hyde_doc, "alt_query": alt_query,
             })
             tag = "과학" if science else "치챗"
             turn = f"{len(user_msgs)}턴"
@@ -342,7 +371,7 @@ def run_pipeline(
     if llm_select:
         print("=== Phase 2.5: LLM 문서 선별 ===")
         print("LLM 로드 중 (문서 선별용) …")
-        llm_sel = _load_llm(cfg)
+        llm_sel = _load_reasoning_llm(cfg, phase3_backend)
         for r in rerank_results:
             if not r["is_science"] or not r["topk_ids"]:
                 continue
@@ -394,7 +423,7 @@ def run_pipeline(
 
     print("=== Phase 3: LLM 답변 생성 ===")
     print("LLM 로드 중 …")
-    llm = _load_llm(cfg)
+    llm = _load_reasoning_llm(cfg, phase3_backend)
 
     for r in rerank_results:
         question = r["msg"][-1]["content"]
@@ -488,10 +517,19 @@ def _load_llm(cfg: dict):
             )
         except Exception as e:
             print(f"  [경고] PEFT 로드 실패 ({e}), base 모델로 fallback: {ckpt_path}")
-            # fallback: checkpoint를 standalone 모델로 시도
+            # fallback: checkpoint를 standalone 모델로 시도 (절대경로는 직접 로드)
+            import torch
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+            _tokenizer = AutoTokenizer.from_pretrained(str(ckpt_path), local_files_only=True)
+            _model = AutoModelForCausalLM.from_pretrained(
+                str(ckpt_path),
+                torch_dtype=torch.bfloat16,
+                device_map="auto",
+                local_files_only=True,
+            )
             return HuggingFaceLLM(
-                model_name=str(ckpt_path),
-                tokenizer_name=str(ckpt_path),
+                model=_model,
+                tokenizer=_tokenizer,
                 max_new_tokens=max_new_tokens,
                 context_window=context_window,
             )
@@ -537,6 +575,18 @@ def main() -> None:
     parser.add_argument("--skip-generation", action="store_true",
                         help="Phase 3 LLM 답변 생성 생략. topk 문서 선별만 수행하여 검색 실험 속도 향상."
                              " 답변은 placeholder로 대체됨. MAP(문서 일치율) 측정용.")
+    parser.add_argument(
+        "--phase0-api",
+        choices=("hf", "solar"),
+        default="hf",
+        help="Phase 0: standalone·HyDE·alt_query·과학판별 — hf=로컬 LLM, solar=Solar Pro API (SOLAR_API_KEY)",
+    )
+    parser.add_argument(
+        "--phase3-api",
+        choices=("hf", "solar"),
+        default="hf",
+        help="Phase 3: answer 생성 — hf=로컬 LLM, solar=Solar Pro API. --llm-select 시 동일 백엔드 사용.",
+    )
     args = parser.parse_args()
 
     if not args.placeholder and not args.pipeline:
@@ -568,6 +618,8 @@ def main() -> None:
             llm_select=args.llm_select,
             use_multi_field=args.multi_field,
             skip_generation=args.skip_generation,
+            phase0_backend=args.phase0_api,
+            phase3_backend=args.phase3_api,
         )
     else:
         rows_out = []
