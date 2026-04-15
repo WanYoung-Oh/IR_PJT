@@ -124,7 +124,10 @@ def main() -> None:
     )
     trainer.train()
 
-    # 5. 어댑터 저장 + 병합 가중치 저장 (추론 시 PEFT 키 불일치 경고 없이 로드 가능)
+    # 5. 어댑터 저장 + 병합 가중치 저장 (추론 시 PEFT 없이 HF 표준 키로 로드)
+    # merge_and_unload().save_pretrained() 만 쓰면 Qwen3 등에서 state_dict 키가
+    # model.language_model.* 처로 남아 AutoModelForCausalLM 로드 시 MISSING/UNEXPECTED 가 난다.
+    # Unsloth 권장: save_pretrained_merged(merged_16bit) → merge_and_overwrite_lora 로 HF 호환 저장.
     model.save_pretrained(str(output_dir))
     tokenizer.save_pretrained(str(output_dir))
     print(f"어댑터 저장 → {output_dir}")
@@ -132,16 +135,26 @@ def main() -> None:
     merged_dir = output_dir / "merged"
     merged_dir.mkdir(parents=True, exist_ok=True)
     try:
-        merged_model = model.merge_and_unload()
-        merged_model.save_pretrained(str(merged_dir))
-        tokenizer.save_pretrained(str(merged_dir))
-        print(f"병합 가중치 저장 → {merged_dir}")
+        if not hasattr(model, "save_pretrained_merged"):
+            raise RuntimeError(
+                "모델에 save_pretrained_merged 가 없습니다. unsloth 버전을 확인하세요."
+            )
+        # QLoRA·bf16 LoRA 공통: LoRA 병합 후 float16/bfloat16 호환 샤드로 저장
+        model.save_pretrained_merged(
+            str(merged_dir),
+            tokenizer=tokenizer,
+            save_method="merged_16bit",
+        )
+        print(f"병합 가중치 저장 (Unsloth merged_16bit) → {merged_dir}")
         print(
             "  (export_submission._load_llm 이 경로를 우선 로드합니다. "
             "config 의 llm.checkpoint 는 기존처럼 상위 폴더만 지정하면 됩니다.)"
         )
     except Exception as e:
-        print(f"[경고] merge_and_unload 또는 병합 저장 실패 — PEFT 어댑터만 사용 가능: {e}")
+        print(
+            f"[경고] save_pretrained_merged(merged_16bit) 실패 — merged/ 없이 "
+            f"PEFT 어댑터만 사용하거나 수동 병합이 필요합니다: {e}"
+        )
 
     print(f"학습 완료 → {output_dir}")
 

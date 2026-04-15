@@ -78,7 +78,7 @@ python scripts/train_sft.py \
 **파이프라인 연결**
 
 1. [config/default.yaml](../config/default.yaml): `llm.model_name`은 베이스 모델, `llm.checkpoint`는 학습 산출 폴더(예: `artifacts/qwen35-4b-rag-sft`).
-2. [scripts/train_sft.py](../scripts/train_sft.py)는 학습 종료 후 어댑터와 함께 **`merged/`** 하위 폴더에 **병합된 전체 가중치**를 저장합니다. [scripts/export_submission.py](../scripts/export_submission.py)의 `_load_llm`은 **`checkpoint/merged`가 있으면 PEFT 로드를 건너뛰고** 여기서 직접 로드하므로, 기존과 같이 상위 폴더만 `llm.checkpoint`에 두면 됩니다 (PEFT 키 불일치 경고 회피).
+2. [scripts/train_sft.py](../scripts/train_sft.py)는 학습 종료 후 어댑터와 함께 **`merged/`** 에 Unsloth **`save_pretrained_merged(..., save_method="merged_16bit")`** 로 **Hugging Face 표준 키**의 병합 가중치를 저장합니다 (`merge_and_unload`만 저장하면 일부 아키텍처에서 키 불일치가 날 수 있음). [scripts/export_submission.py](../scripts/export_submission.py)의 `_load_llm`은 **`checkpoint/merged`가 있으면 PEFT 로드를 건너뛰고** 여기서 직접 로드하므로, 기존과 같이 상위 폴더만 `llm.checkpoint`에 두면 됩니다.
 3. `merged/`가 없는 예전 체크포인트만 있을 때는 이전처럼 PEFT 병합 경로를 탑니다.
 
 **think / `<think>`**

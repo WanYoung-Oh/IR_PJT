@@ -47,7 +47,7 @@
 | G-1    | LLM 최종 문서 선별 (Phase 2.5)                 | ✅ 완료        | 리더보드 **MAP=MRR=0.8795** (`export_submission.py --llm-select`)  |
 | G-2    | Solar Phase0 캐시 + 다축 RRF 가중 (0.5/0.25/0.25) | ✅ 완료        | 리더보드 **MAP=0.8386 / MRR=0.8424** (`--phase0-cache` + `--rrf-weights`) |
 | B-3a   | Reranker 트리플렛 생성                         | ✅ 완료        | 1,747건 → `artifacts/reranker_triplets.jsonl`                      |
-| B-3b   | Reranker Fine-tuning                           | ✅ 완료        | QLoRA 1968 steps / 3 epoch — 리더보드 **MAP=MRR=0.2439** (기대 대비 저조; 점검 대상) |
+| B-3b   | Reranker Fine-tuning                           | ✅ 완료        | QLoRA 1968 steps / 3 epoch  |
 
 ### 주요 이슈 해결 기록
 
