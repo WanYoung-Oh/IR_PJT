@@ -475,7 +475,10 @@ def _load_llm(cfg: dict):
 
     우선순위:
     1. vllm.url 설정 시 → vLLM OpenAI 호환 API
-    2. llm.checkpoint 설정 시 → 로컬 fine-tuned 체크포인트 (PEFT LoRA 포함)
+    2. llm.checkpoint 설정 시 →
+       - ``<checkpoint>/merged`` 에 ``train_sft`` 병합 저장이 있으면 PEFT 없이 직접 로드
+       - 또는 checkpoint 폴더가 어댑터가 아닌 통합 모델이면 직접 로드
+       - 그 외 PEFT LoRA 어댑터 병합 후 로드
     3. 기본 → HuggingFace hub에서 llm.model_name 직접 로드
     """
     vllm_url = cfg.get("vllm", {}).get("url")
@@ -497,7 +500,8 @@ def _load_llm(cfg: dict):
     max_new_tokens = llm_cfg.get("max_new_tokens", 512)
     context_window = llm_cfg.get("context_window", 4096)
 
-    # checkpoint 지정 시: PEFT LoRA 어댑터 병합 후 로드
+    # checkpoint 지정 시: (1) train_sft 가 저장한 merged/ 가 있으면 PEFT 없이 로드
+    # (2) 그 외 PEFT LoRA 어댑터 병합 후 로드
     if checkpoint:
         import os
         from pathlib import Path
@@ -506,7 +510,42 @@ def _load_llm(cfg: dict):
             # config 기준 상대경로 → repo root 기준으로 해석
             from ir_rag.config import repo_root_from
             ckpt_path = repo_root_from(Path.cwd()) / ckpt_path
+
+        trust_remote = llm_cfg.get("trust_remote_code", True)
         print(f"LLM: 체크포인트 로드 — base={base_model}, ckpt={ckpt_path}")
+
+        def _hf_llm_from_dir(model_dir: Path, label: str):
+            import torch
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+
+            print(f"  {label} → {model_dir}")
+            tok = AutoTokenizer.from_pretrained(
+                str(model_dir),
+                local_files_only=True,
+                trust_remote_code=trust_remote,
+            )
+            mdl = AutoModelForCausalLM.from_pretrained(
+                str(model_dir),
+                torch_dtype=torch.bfloat16,
+                device_map="auto",
+                local_files_only=True,
+                trust_remote_code=trust_remote,
+            )
+            return HuggingFaceLLM(
+                model=mdl,
+                tokenizer=tok,
+                max_new_tokens=max_new_tokens,
+                context_window=context_window,
+            )
+
+        merged_subdir = ckpt_path / "merged"
+        if merged_subdir.is_dir() and (merged_subdir / "config.json").is_file():
+            return _hf_llm_from_dir(merged_subdir, "병합 모델 직접 로드 (PEFT 스킵)")
+
+        # checkpoint 가 이미 "통째 병합 모델" 폴더만 가리키는 경우
+        if (ckpt_path / "config.json").is_file() and not (ckpt_path / "adapter_config.json").is_file():
+            return _hf_llm_from_dir(ckpt_path, "통합 체크포인트 직접 로드")
+
         try:
             from peft import PeftModel, PeftConfig
             import torch
@@ -514,11 +553,15 @@ def _load_llm(cfg: dict):
             peft_cfg = PeftConfig.from_pretrained(str(ckpt_path))
             # base_model이 config와 다를 수 있으므로 PEFT config 우선
             actual_base = peft_cfg.base_model_name_or_path or base_model
-            tokenizer = AutoTokenizer.from_pretrained(actual_base)
+            tokenizer = AutoTokenizer.from_pretrained(
+                actual_base,
+                trust_remote_code=trust_remote,
+            )
             model = AutoModelForCausalLM.from_pretrained(
                 actual_base,
                 torch_dtype=torch.bfloat16,
                 device_map="auto",
+                trust_remote_code=trust_remote,
             )
             model = PeftModel.from_pretrained(model, str(ckpt_path))
             model = model.merge_and_unload()
@@ -534,12 +577,17 @@ def _load_llm(cfg: dict):
             # fallback: checkpoint를 standalone 모델로 시도 (절대경로는 직접 로드)
             import torch
             from transformers import AutoModelForCausalLM, AutoTokenizer
-            _tokenizer = AutoTokenizer.from_pretrained(str(ckpt_path), local_files_only=True)
+            _tokenizer = AutoTokenizer.from_pretrained(
+                str(ckpt_path),
+                local_files_only=True,
+                trust_remote_code=trust_remote,
+            )
             _model = AutoModelForCausalLM.from_pretrained(
                 str(ckpt_path),
                 torch_dtype=torch.bfloat16,
                 device_map="auto",
                 local_files_only=True,
+                trust_remote_code=trust_remote,
             )
             return HuggingFaceLLM(
                 model=_model,

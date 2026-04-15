@@ -39,11 +39,13 @@ reranker:
 # checkpoint: 로컬 fine-tuned 모델 경로 지정 시 해당 가중치 사용
 #             null 이면 model_name(HuggingFace hub) 직접 로드
 # 예시:
-#   checkpoint: "artifacts/qwen35-4b-science-rag"  # SFT 체크포인트
+#   checkpoint: "artifacts/qwen35-4b-science-rag"  # SFT 어댑터; train_sft 가 merged/ 병합본도 저장하면 자동 우선 로드
 #   checkpoint: null                                # HuggingFace 기본 모델
 llm:
   model_name: "Qwen/Qwen3.5-4B"
-  checkpoint: "artifacts/qwen35-4b-science-rag"
+  checkpoint: "artifacts/qwen35-4b-rag-sft"
+  # Qwen 등 trust_remote_code 필요 모델용 (기본 true)
+  # trust_remote_code: true
   max_new_tokens: 512
   context_window: 4096
 

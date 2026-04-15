@@ -78,7 +78,13 @@ python scripts/train_sft.py \
 **파이프라인 연결**
 
 1. [config/default.yaml](../config/default.yaml): `llm.model_name`은 베이스 모델, `llm.checkpoint`는 학습 산출 폴더(예: `artifacts/qwen35-4b-rag-sft`).
-2. [scripts/export_submission.py](../scripts/export_submission.py)의 `_load_llm`이 PEFT 어댑터를 병합해 로드합니다.
+2. [scripts/train_sft.py](../scripts/train_sft.py)는 학습 종료 후 어댑터와 함께 **`merged/`** 하위 폴더에 **병합된 전체 가중치**를 저장합니다. [scripts/export_submission.py](../scripts/export_submission.py)의 `_load_llm`은 **`checkpoint/merged`가 있으면 PEFT 로드를 건너뛰고** 여기서 직접 로드하므로, 기존과 같이 상위 폴더만 `llm.checkpoint`에 두면 됩니다 (PEFT 키 불일치 경고 회피).
+3. `merged/`가 없는 예전 체크포인트만 있을 때는 이전처럼 PEFT 병합 경로를 탑니다.
+
+**think / `<think>`**
+
+- Qwen3.5-4B는 문서상 thinking 기본 비활성입니다. 파이프라인은 프롬프트를 주로 **평문 `complete()`**로 넣으며, 모델이 `<think>` 블록을 섞어 내면 [query_rewrite.py](../src/ir_rag/query_rewrite.py)·[generator.py](../src/ir_rag/generator.py)의 `_strip_think` 등에서 제거합니다.
+- 채팅 템플릿에 `enable_thinking=False`를 명시하려면 HuggingFaceLLM 생성 경로를 확장해야 하며, 현재는 **후처리 제거**가 주 방어선입니다.
 
 로컬에서 짧게 돌려 보려면 `--phase0-api hf --phase3-api hf` 같은 옵션으로 스모크 테스트할 수 있습니다(서버는 사용자 환경에서 실행).
 

@@ -124,9 +124,25 @@ def main() -> None:
     )
     trainer.train()
 
-    # 5. 저장
+    # 5. 어댑터 저장 + 병합 가중치 저장 (추론 시 PEFT 키 불일치 경고 없이 로드 가능)
     model.save_pretrained(str(output_dir))
     tokenizer.save_pretrained(str(output_dir))
+    print(f"어댑터 저장 → {output_dir}")
+
+    merged_dir = output_dir / "merged"
+    merged_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        merged_model = model.merge_and_unload()
+        merged_model.save_pretrained(str(merged_dir))
+        tokenizer.save_pretrained(str(merged_dir))
+        print(f"병합 가중치 저장 → {merged_dir}")
+        print(
+            "  (export_submission._load_llm 이 경로를 우선 로드합니다. "
+            "config 의 llm.checkpoint 는 기존처럼 상위 폴더만 지정하면 됩니다.)"
+        )
+    except Exception as e:
+        print(f"[경고] merge_and_unload 또는 병합 저장 실패 — PEFT 어댑터만 사용 가능: {e}")
+
     print(f"학습 완료 → {output_dir}")
 
 
