@@ -36,7 +36,7 @@ def es_bm25_top_score(
         es_query = {
             "multi_match": {
                 "query": query,
-                "fields": ["title^2", "keywords^1.5", "summary", "content"],
+                "fields": ["title^2", "keywords^1.5", "summary^1.2", "content^1.2"],
                 "type": "best_fields",
             }
         }
@@ -74,7 +74,7 @@ def es_bm25_doc_ids(
         es_query = {
             "multi_match": {
                 "query": query,
-                "fields": ["title^2", "keywords^1.5", "summary", "content"],
+                "fields": ["title^2", "keywords^1.5", "summary^1.2", "content^1.2"],
                 "type": "best_fields",
             }
         }
