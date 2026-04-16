@@ -591,6 +591,20 @@ python scripts/export_submission.py \
   -o artifacts/sample_submission_weighted_3axis.csv
 ```
 
+**Phase 2.5 비활성화 + Reranker 출력으로 제출·평가** (리더보드 기록: [`PLAN_UP.md`](PLAN_UP.md) 실험 **G-3** — MAP/MRR **0.925 / 0.9242**; `--llm-select` 없음):
+
+```bash
+python scripts/export_submission.py \
+  --pipeline \
+  --config config/default.yaml \
+  --multi-field \
+  --rrf-weights 0.4,0.3,0.3 \
+  --bm25-weight 0.7 --dense-weight 0.3 \
+  --top-k-retrieve 30 \
+  --top-k-rerank 15 \
+  -o artifacts/sample_submission_g3_rerank_only.csv
+```
+
 | 옵션 | 기본값 | 설명 |
 | --- | --- | --- |
 | `--phase0-api` | `hf` | `hf` = `config`의 로컬 LLM · `solar` = Solar Pro (standalone·HyDE·alt_query·과학 판별) |

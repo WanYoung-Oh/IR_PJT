@@ -25,9 +25,11 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 import uuid
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT / "src") not in sys.path:
@@ -42,16 +44,24 @@ from ir_rag.io_util import iter_jsonl, write_jsonl
 from ir_rag.llm_openai_chat import OpenAIChatCompletionLLM
 from ir_rag.query_rewrite import build_search_query, generate_alt_query, is_science_question
 from ir_rag.reranker import load_reranker, rerank_with_crossencoder, soft_voting_rerank
-from ir_rag.retrieval import es_bm25_doc_ids, generate_hyde_doc, qdrant_dense_doc_ids, rrf_score
+from ir_rag.retrieval import (
+    build_uuid_to_docid,
+    es_bm25_doc_ids,
+    generate_hyde_doc,
+    qdrant_dense_doc_ids,
+    rrf_score,
+)
 from ir_rag.submission import SubmissionRecord, validate_submission_row
 from ir_rag.vram import unload_model
+
+logger = logging.getLogger(__name__)
 
 
 def _llm_select_docs(
     query: str,
     candidate_ids: list[str],
     doc_map: dict[str, str],
-    llm: any,
+    llm: Any,
     top_k: int = 3,
 ) -> list[str]:
     """Phase 2.5: LLM 프롬프트로 top-k 문서를 선별한다.
@@ -103,8 +113,8 @@ def _llm_select_docs(
                 break
         if len(result) >= top_k:
             return result
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("LLM 문서 선별 실패, Reranker 순 폴백: %s", e)
     # 폴백: Reranker 점수 순 상위 top_k
     return valid_ids[:top_k]
 
@@ -173,7 +183,6 @@ def run_pipeline(
     from qdrant_client import QdrantClient
 
     from ir_rag.embeddings import build_huggingface_embedding
-    from ir_rag.retrieval import build_uuid_to_docid, qdrant_dense_doc_ids
 
     eval_path = root / cfg["paths"]["eval"]
     doc_path = root / cfg["paths"]["documents"]
@@ -464,7 +473,7 @@ def run_pipeline(
         row = rec.to_dict()
         validate_submission_row(row)
         rows_out.append(row)
-        print(f"  [{r['eid']}] {r['standalone'][:40]}… → {r['topk_ids'][:top_k_submit]}")
+        print(f"  [{r['eid']}] {r['standalone'][:40]}… → 제출 topk: {topk_final}")
 
     llm = unload_model(llm)
     return rows_out

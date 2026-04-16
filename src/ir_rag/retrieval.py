@@ -9,6 +9,19 @@ from elasticsearch.exceptions import ConnectionError as ESConnectionError
 from elasticsearch.exceptions import NotFoundError
 
 
+def _bm25_query_body(query: str, use_multi_field: bool) -> dict[str, Any]:
+    """BM25 검색용 ES `query` 절 (multi_field 시 필드 boost 일원화)."""
+    if use_multi_field:
+        return {
+            "multi_match": {
+                "query": query,
+                "fields": ["title^2", "keywords^1.5", "summary^1.2", "content^1.2"],
+                "type": "best_fields",
+            }
+        }
+    return {"match": {"content": query}}
+
+
 def build_uuid_to_docid(doc_path: str) -> dict[str, str]:
     """documents.jsonl을 읽어 UUID5(docid) → 원본 docid 역매핑을 생성한다."""
     import json
@@ -32,16 +45,7 @@ def es_bm25_top_score(
     query: str,
     use_multi_field: bool = False,
 ) -> float:
-    if use_multi_field:
-        es_query = {
-            "multi_match": {
-                "query": query,
-                "fields": ["title^2", "keywords^1.5", "summary^1.2", "content^1.2"],
-                "type": "best_fields",
-            }
-        }
-    else:
-        es_query = {"match": {"content": query}}
+    es_query = _bm25_query_body(query, use_multi_field)
     try:
         resp = es.search(
             index=index,
@@ -70,16 +74,7 @@ def es_bm25_doc_ids(
         ``True`` 이면 title(^2)·keywords(^1.5)·summary·content 멀티필드 검색.
         F-2 메타 색인 이후에 활성화한다.
     """
-    if use_multi_field:
-        es_query = {
-            "multi_match": {
-                "query": query,
-                "fields": ["title^2", "keywords^1.5", "summary^1.2", "content^1.2"],
-                "type": "best_fields",
-            }
-        }
-    else:
-        es_query = {"match": {"content": query}}
+    es_query = _bm25_query_body(query, use_multi_field)
 
     try:
         resp = es.search(
@@ -228,11 +223,15 @@ def hybrid_search_with_hyde(
     es: Elasticsearch,
     index: str,
     hyde_threshold: float = 5.0,
+    axis_weights: tuple[float, float, float] | None = None,
 ) -> dict[str, float]:
     """BM25 top score 기반으로 HyDE를 조건부 실행하는 하이브리드 검색.
 
     BM25 최고 점수가 ``hyde_threshold`` 이상이면 원본 쿼리 결과만 RRF 로 반환한다.
     임계값 미만이면 HyDE 문서와 쿼리 재작성을 추가하여 3축 RRF 를 수행한다.
+
+    ``axis_weights`` 는 ``export_submission.run_pipeline`` 의 다축 가중
+    (standalone, HyDE, alt_query) 와 동일한 의미다. ``None`` 이면 균등(1,1,1).
 
     Parameters
     ----------
@@ -251,6 +250,8 @@ def hybrid_search_with_hyde(
         높게(10+) → 거의 항상 HyDE 실행 /
         낮게(2~3) → 검색 미흡 시만 실행 /
         기본값 5.0 → 균형.
+    axis_weights:
+        3축 RRF 가중치 ``(standalone, HyDE, alt_query)``. ``None`` 이면 균등.
 
     Returns
     -------
@@ -274,4 +275,8 @@ def hybrid_search_with_hyde(
     alt_query = llm.complete(fusion_prompt).text.strip()
     results_alt = retriever_fn(alt_query)
 
-    return rrf_score([results_original, results_hyde, results_alt])
+    w0, w1, w2 = axis_weights if axis_weights is not None else (1.0, 1.0, 1.0)
+    return rrf_score(
+        [results_original, results_hyde, results_alt],
+        weights=[w0, w1, w2],
+    )
