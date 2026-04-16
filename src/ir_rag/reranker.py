@@ -125,7 +125,7 @@ def rerank_with_crossencoder(
         for did, score in zip(batch_ids, batch_scores):
             scores[did] = float(score)
 
-    return dict(sorted(scores.items(), key=lambda x: x[1], reverse=True))
+    return dict(sorted(scores.items(), key=lambda t: (-t[1], t[0])))
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +143,7 @@ def _minmax_normalize(values: np.ndarray) -> np.ndarray:
 def soft_voting_rerank(
     rrf_scores: dict[str, float],
     reranker_scores: dict[str, float],
-    w_reranker: float = 0.7,
+    w_reranker: float = 0.65,
 ) -> dict[str, float]:
     """MinMax 정규화 후 Reranker/RRF 점수를 가중 결합한다.
 
@@ -164,7 +164,7 @@ def soft_voting_rerank(
     dict[str, float]
         docid → 결합 점수, 내림차순 정렬.
     """
-    doc_ids = list(set(rrf_scores) | set(reranker_scores))
+    doc_ids = sorted(set(rrf_scores) | set(reranker_scores))
     if not doc_ids:
         return {}
 
@@ -175,4 +175,4 @@ def soft_voting_rerank(
     rer_norm = _minmax_normalize(rer_vals)
 
     combined = w_reranker * rer_norm + (1.0 - w_reranker) * rrf_norm
-    return dict(sorted(zip(doc_ids, combined), key=lambda x: x[1], reverse=True))
+    return dict(sorted(zip(doc_ids, combined), key=lambda x: (-x[1], x[0])))

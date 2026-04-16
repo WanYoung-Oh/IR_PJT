@@ -152,7 +152,7 @@ def qdrant_dense_doc_ids(
 
 def rrf_score(
     rankings: list[list[str]],
-    k: int = 20,
+    k: int = 30,
     weights: list[float] | None = None,
 ) -> dict[str, float]:
     """여러 검색 결과 랭킹을 RRF 공식으로 통합하여 점수 딕셔너리를 반환한다.
@@ -184,7 +184,8 @@ def rrf_score(
     for ranking, w in zip(rankings, weights):
         for rank, doc_id in enumerate(ranking):
             scores[doc_id] = scores.get(doc_id, 0.0) + w / (k + rank + 1)
-    return dict(sorted(scores.items(), key=lambda x: x[1], reverse=True))
+    # 동점 시 docid 로 안정 정렬 (실행 간 순서 흔들림 완화)
+    return dict(sorted(scores.items(), key=lambda t: (-t[1], t[0])))
 
 
 # ---------------------------------------------------------------------------

@@ -57,6 +57,44 @@ from ir_rag.vram import unload_model
 logger = logging.getLogger(__name__)
 
 
+def _configure_reproducibility(seed: int) -> None:
+    """임베딩·리랭커 등 PyTorch 연산 전에 호출한다.
+
+    동일 ``seed``·정렬 타이브레이크(``reranker``/``retrieval``)로 실행 간 차이를 줄인다.
+    GPU 커널·드라이버에 따라 비트 단위 완전 일치는 보장되지 않을 수 있다.
+    """
+    import random
+
+    random.seed(seed)
+    try:
+        import numpy as np
+        np.random.seed(seed)
+    except ImportError:
+        pass
+    try:
+        import torch
+
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        except TypeError:
+            try:
+                torch.use_deterministic_algorithms(True)
+            except Exception:
+                pass
+    except ImportError:
+        logger.warning("torch 미설치 — 시드·cuDNN 설정 생략")
+        return
+    print(
+        f"재현성: random/numpy/torch seed={seed}, "
+        "cudnn.deterministic=True, cudnn.benchmark=False"
+    )
+
+
 def _llm_select_docs(
     query: str,
     candidate_ids: list[str],
@@ -130,8 +168,8 @@ def _load_reasoning_llm(cfg: dict, backend: str):
 def run_pipeline(
     cfg: dict,
     root: Path,
-    top_k_retrieve: int = 20,
-    top_k_rerank: int = 10,
+    top_k_retrieve: int = 30,
+    top_k_rerank: int = 15,
     top_k_submit: int = 3,
     skip_rewrite: bool = False,
     skip_dense: bool = False,
@@ -144,6 +182,7 @@ def run_pipeline(
     phase0_backend: str = "hf",
     phase3_backend: str = "hf",
     axis_rrf_weights: tuple[float, float, float] | None = None,
+    seed: int = 42,
 ) -> list[dict]:
     """전체 RAG 파이프라인을 실행하여 제출 행 목록을 반환한다.
 
@@ -178,7 +217,11 @@ def run_pipeline(
     axis_rrf_weights:
         ``(standalone, HyDE, alt_query)`` 순서의 Phase 1 다축 RRF 가중치.
         ``None`` 이면 균등 ``(1.0, 1.0, 1.0)``. 2축일 때는 (standalone, 존재하는 축)에 매핑.
+    seed:
+        ``random`` / NumPy / PyTorch 시드 및 cuDNN 결정적 모드. 임베딩·리랭커 로드 **전**에 적용.
     """
+    _configure_reproducibility(seed)
+
     from elasticsearch import Elasticsearch
     from qdrant_client import QdrantClient
 
@@ -665,6 +708,12 @@ def main() -> None:
         help="Phase 1에서 standalone / HyDE / alt_query 다축 RRF 가중치 (쉼표로 3개). "
              "예: 0.5,0.25,0.25. 기본은 균등 1,1,1. 2축일 때는 standalone과 존재하는 축에만 적용.",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="--pipeline 시 random/NumPy/torch 시드 및 cuDNN 결정적 모드 (기본 42).",
+    )
     args = parser.parse_args()
 
     if not args.placeholder and not args.pipeline:
@@ -710,6 +759,7 @@ def main() -> None:
             phase0_backend=args.phase0_api,
             phase3_backend=args.phase3_api,
             axis_rrf_weights=axis_rrf_weights,
+            seed=args.seed,
         )
     else:
         rows_out = []
