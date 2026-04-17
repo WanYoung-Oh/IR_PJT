@@ -1,0 +1,233 @@
+광합성, photosynthesis
+생물 다양성, 생물다양성
+생물 다양성, 유전적 다양성
+물, H2O
+질량, mass
+태양, sun
+산소, oxygen
+산소, O2
+화학 반응, chemical reaction
+생태계 균형, 생태계 평형
+진화, evolution
+이산화탄소, CO2
+지구, earth
+운동 에너지, kinetic energy
+실험, experiment
+환경 보호, 환경보전
+지속 가능성, sustainability
+유전 정보, 유전자 정보
+에너지, energy
+온도, temperature
+달, moon
+전자, electron
+자기장, magnetic field
+천문학, astronomy
+에너지 변환, energy conversion
+힘, force
+속도, velocity
+거리, distance
+신뢰성, 신뢰도
+양성자, proton
+증발, evaporation
+가속도, acceleration
+기후 변화, climate change
+밀도, density
+파장, wavelength
+수증기, water vapor
+DNA, deoxyribonucleic acid
+상태 변화, phase change
+식물, plant
+분자 운동, molecular motion
+화석 연료, fossil fuel
+계절 변화, seasonal change
+전기 회로, electric circuit
+열에너지, thermal energy
+전류, electric current
+에너지 전달, energy transfer
+유전, heredity
+얼음, ice
+생존, survival
+번식, reproduction
+유전자, gene
+열 전달, heat transfer
+태양 에너지, solar energy
+수소, hydrogen
+파동, wave
+주파수, frequency
+물리, 물리학
+빛, 햇빛
+화학 에너지, 에너지 생산
+유전자 발현, 유전자 변이
+ATP, 에너지 생산
+열 에너지, 물리
+무게, 마찰력
+분자 구조, 화학 에너지
+환경 변화, 환경 적응
+노화, 노인
+지구 온난화, 환경 변화
+중성자, 별
+진동, 물리
+고체, 물리
+포도당, 식물 성장
+바이러스, 유전자 변이
+화성, 별
+시간, 물리
+주기율표, 화학 에너지
+파이썬, 프로그래밍 언어
+근육 수축, 근수축
+돌연변이, 변이
+원자, atom
+전기 에너지, 전기적 에너지, electrical energy
+공전, revolution
+운동, movement
+핵융합, nuclear fusion
+전하, electric charge
+단백질, protein
+열역학, thermodynamics
+씨앗, 종자
+화석, fossil
+석탄, coal
+에너지원, energy source
+상호작용, interaction
+환경 친화적, eco-friendly
+세포 분열, cell division
+지각 변동, tectonic movement
+환경 오염, environmental pollution
+해양 생태계, marine ecosystem
+보안 취약점, security vulnerability
+세포, cell
+전압, voltage, electric potential difference
+물 분자, water molecule
+압력, pressure
+에너지 소비, energy consumption
+지구 자전, earth rotation
+환경 영향, environmental impact
+지속 가능한 에너지, sustainable energy
+세포막, 세포막(細胞膜), cell membrane
+빛의 속도, 광속(光速), speed of light
+평균 속도, 평균속력, mean velocity
+녹는점, 융점(融點), melting point
+화산 폭발, 분화(噴火), volcanic eruption
+침식, 침식(侵蝕), erosion
+환경 요인, 환경 인자, environmental factors
+생태계 영향, 생태적 영향, ecological impact
+산소 공급, 산소 공급량, oxygen supply
+물리적 특성, 물리적 성질, physical properties
+화학적 변화, 화학 반응, chemical change
+저항, 전기 저항, resistance
+우주 탐사, 우주 탐사선, space exploration
+과학적 방법, 과학 방법론, scientific method
+측정, 측정값, measurement
+부피, 체적(體積), volume
+기체, 가스, gas
+액체, 액상(液狀), liquid
+호흡, 호흡 작용, respiration
+헬륨, He
+pH, 수소 이온 농도
+상대성 이론, 상대론
+미토콘드리아, 사립체
+운동량, 운동량 보존
+위치 에너지, 퍼텐셜 에너지
+질량 보존, 질량 보존 법칙
+심혈관 질환, 심장혈관 질환
+행성, 혹성
+위성, 인공위성
+탄소, 카본
+설탕, 수크로스
+염색체, 염색분체
+식물 세포, 식물세포
+식물, 나무
+부력, 부력 효과
+대기, 대기권
+금속, 메탈
+적응력, 적응 능력
+지형 변화, 지형 변무
+실험 반복, 실험 재현
+화합물, 화합물(化合物)
+철, 철(Fe)
+전자기파, 전자기파(electromagnetic wave)
+먹이 사슬, 먹이사슬
+초기 속도, 초기속도
+서식지, 서식처
+마찰, 마찰력
+실험 설계, 실험계획
+충돌, 충돌(collision)
+열 방출, 발열
+지각, 지각(地殼)
+물리적 변화, 물리적 변화(physical change)
+소금, 염화 나트륨(NaCl)
+핵, 원자핵(nucleus)
+비만, 과체중
+퇴적암, 퇴적암(sedimentary rock)
+용해, 용해(dissolution)
+강수, 강수(降水)
+바위, 암석(巖石)
+공전 주기, 공전주기
+중추신경계, CNS
+난자, ovum
+풍화, 풍화작용
+전구, 전구체
+온실 효과, greenhouse effect
+산성비, acid rain
+대기 오염, air pollution
+혈액 순환, blood circulation
+자원 보존, resource conservation
+공기, air
+과학적 연구, 과학 연구
+예방, 예방의학
+구리, Cu
+화산 활동, volcanic activity
+대기권, atmosphere
+교배, 교접
+꽃, 화서
+혼합물, 혼합체
+단백질 합성, protein synthesis
+호르몬, hormone
+박테리아, 세균
+경제 성장, economic growth
+유전적 특성, genetic trait
+건강 관리, healthcare
+에너지 절약, energy saving
+궤도, orbit
+생태계 변화, ecosystem change
+성장, growth
+유전자 조작, 유전자 변형
+면역 체계, 면역계
+열전달, 열 이동
+지질학, 암석학
+무성 생식, 무성 번식
+상변화, 상태 변화
+응축, 액화
+냉각, 냉각화
+핵분열, 원자핵 분열
+자전, 자기 회전
+자유 낙하, 자유 낙하 운동
+공통 조상, 공통 선조
+지진, earthquake
+투명성, transparency
+반응 속도, reaction rate
+허리케인, hurricane
+질소, nitrogen, N
+아미노산, amino acid
+분해, decomposition
+유기물, organic matter
+용암, lava
+물리 법칙, physical law
+영양소 흡수, nutrient absorption
+인력, attractive force
+위장, camouflage
+온도 조절, temperature regulation
+근육, muscle
+전자 구조, electronic structure
+나트륨, sodium, Na
+강수량, precipitation
+광년, light-year
+공기 저항, air resistance
+EPR 스펙트럼, ESR 스펙트럼
+생명 주기, life cycle
+버퍼 오버플로우, buffer overflow
+화학적 특성, chemical property
+에너지 손실, energy loss
+양자역학, quantum mechanics
+당분해, glycolysis
+굴절, refraction
