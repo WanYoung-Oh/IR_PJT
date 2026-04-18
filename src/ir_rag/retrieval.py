@@ -8,6 +8,8 @@ from elasticsearch import Elasticsearch
 from elasticsearch.exceptions import ConnectionError as ESConnectionError
 from elasticsearch.exceptions import NotFoundError
 
+from ir_rag.query_rewrite import generate_alt_query
+
 
 def _bm25_query_body(query: str, use_multi_field: bool) -> dict[str, Any]:
     """BM25 검색용 ES `query` 절 (multi_field 시 필드 boost 일원화)."""
@@ -15,7 +17,7 @@ def _bm25_query_body(query: str, use_multi_field: bool) -> dict[str, Any]:
         return {
             "multi_match": {
                 "query": query,
-                "fields": ["title^2", "keywords^1.5", "summary^1.2", "content^1.2"],
+                "fields": ["title^2", "keywords^1.5", "summary^1.2", "content^3"],
                 "type": "best_fields",
             }
         }
@@ -210,7 +212,10 @@ def generate_hyde_doc(query: str, llm: Any) -> str:
     """
     import re
     prompt = (
-        "다음 과학 질문에 대한 정확한 설명 문단을 100자 내외로 작성하세요.\n"
+        "다음 과학·학문 질문에 대해, 검색에 도움이 되도록 **짧은 설명 문단**을 "
+        "한국어로 약 100자 내외로 작성하세요.\n"
+        "질문에 나온 용어·고유명사·수치·단위·기호는 가능한 그대로 쓰고, "
+        "질문에 없는 인물·고유명·수치·사실을 새로 지어내지 마세요.\n"
         f"질문: {query}\n설명:"
     )
     raw = llm.complete(prompt).text
@@ -269,11 +274,7 @@ def hybrid_search_with_hyde(
     hyde_doc = generate_hyde_doc(query, llm)
     results_hyde = retriever_fn(hyde_doc)
 
-    fusion_prompt = (
-        "다음 과학 질문을 다른 표현으로 재작성하세요 (1개만).\n"
-        f"질문: {query}\n재작성:"
-    )
-    alt_query = llm.complete(fusion_prompt).text.strip()
+    alt_query = generate_alt_query(query, llm)
     results_alt = retriever_fn(alt_query)
 
     w0, w1, w2 = axis_weights if axis_weights is not None else (1.0, 1.0, 1.0)

@@ -18,7 +18,7 @@ submission_top_k: 3
 embedding:
   model_name: "Qwen/Qwen3-Embedding-8B"
   query_instruction: 'Instruct: Given a question, retrieve relevant Korean science passages that answer the question\nQuery: '
-  text_instruction: "Represent this Korean science passage for retrieval: "
+  text_instruction: "Instruct: Encode this Korean science passage to be retrieved for science questions\nPassage: "
   max_length: 8192
   trust_remote_code: true # Qwen 모델은 true 필요
 
