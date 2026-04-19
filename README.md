@@ -12,6 +12,8 @@
 
 > **로컬 MAP 한계**: 공개 데이터에 정답 docid(GT)가 없어 로컬 점수는 상대 비교용입니다.  
 > 최종 순위는 제출 후 공식 결과를 기준으로 합니다.
+>
+> **현재 최고 성능 (2026-04-19)**: ES 사용자사전·동의어 보완(F-2c) + Embedding Instruction 도메인 강화 + Qdrant 재인덱싱(F-3) + multi-field boost 튜닝(`Title^2, Keywords^1.5, Summary^1.2, Content^3.5`) → 리더보드 **MAP=0.9250 / MRR=0.9273**
 
 ---
 
@@ -30,10 +32,10 @@ flowchart LR
     end
 
     subgraph pipeline ["② ~ ⑤ 파이프라인 (4-Phase 순차 로드)"]
-        QP["Phase 0: 쿼리 재작성<br>로컬 LLM 또는 Solar Pro<br>standalone·HyDE·alt_query"]
-        RET["Phase 1: Hybrid Retrieval<br>Embedding 8B + BM25<br>→ RRF Top-20"]
-        RNK["Phase 2: Reranking<br>Qwen3-Reranker-8B<br>+ Soft Voting → Top-10"]
-        GEN["Phase 3: 응답 생성<br>로컬 LLM 또는 Solar Pro<br>CRAG + Self-check"]
+        QP["Phase 0: 쿼리 재작성<br>Solar Pro API<br>standalone·HyDE·alt_query"]
+        RET["Phase 1: Hybrid Retrieval<br>Embedding 8B + BM25<br>→ RRF Top-30"]
+        RNK["Phase 2: Reranking<br>Qwen3-Reranker-8B<br>+ Soft Voting → Top-15"]
+        GEN["Phase 3: 응답 생성<br>Solar Pro API<br>CRAG + Self-check"]
     end
 
     subgraph out ["⑥ 출력"]
@@ -140,18 +142,20 @@ sudo systemctl start elasticsearch
 ./qdrant &
 
 # 4. 색인
-python scripts/index_es.py --config config/default.yaml
-python scripts/index_qdrant.py --config config/default.yaml   # GPU 필요
+# ES: 메타·동의어 포함 재인덱싱 (F-2c 보완 버전 — doc_metadata.jsonl·science_synonyms.txt 사전 생성 필요)
+python scripts/index_es.py --config config/default.yaml \
+  --metadata artifacts/doc_metadata.jsonl \
+  --synonyms artifacts/science_synonyms.txt \
+  --lm-jelinek-mercer --recreate
+# Qdrant: Embedding Instruction 도메인 강화 후 재인덱싱 (F-3)
+python scripts/index_qdrant.py --config config/default.yaml --force   # GPU 필요
 
 # 5. 동작 확인
 python scripts/smoke_e2e.py --config config/default.yaml
 python scripts/verify_indices.py --config config/default.yaml   # ES·Qdrant 색인 점검
 python -m pytest tests/ -v
 
-# 6. 실제 파이프라인 제출 (GPU: 임베딩·Reranker·로컬 LLM 시 필요)
-python scripts/export_submission.py --pipeline --config config/default.yaml
-
-# Phase 0·3만 Solar Pro API (로컬 생성 LLM 미사용 — SOLAR_API_KEY, openai 패키지)
+# 6. 실제 파이프라인 제출 (Phase 0·3: Solar Pro API — SOLAR_API_KEY 필요 / Phase 1·2: GPU 필요)
 python scripts/export_submission.py --pipeline --config config/default.yaml \
   --phase0-api solar --phase3-api solar
 
@@ -168,31 +172,35 @@ python scripts/validate_submission.py artifacts/sample_submission.csv
 
 ## 구현 현황
 
-| 단계                              | 모듈                                             | 상태                 |
-| --------------------------------- | ------------------------------------------------ | -------------------- |
-| 문서 전처리                       | `preprocess.py`                                  | ✅                   |
-| 치챗/과학 분류                    | `query_rewrite.is_science_question`              | ✅                   |
-| 쿼리 재작성 (멀티턴)              | `query_rewrite.build_search_query`               | ✅                   |
-| alt_query (3축 RRF)             | `query_rewrite.generate_alt_query`               | ✅                   |
-| Solar Pro / OpenAI Chat 브릿지    | `llm_openai_chat.OpenAIChatCompletionLLM`      | ✅ (`export_submission --phase*-api solar`) |
-| ES 색인 (Nori + 사용자 사전)      | `es_util.py`, `scripts/index_es.py`              | ✅                   |
-| Qdrant 벡터 색인                  | `embeddings.py`, `scripts/index_qdrant.py`       | ✅                   |
-| BM25 검색                         | `retrieval.es_bm25_doc_ids`                      | ✅                   |
-| Dense 검색                        | `retrieval.qdrant_dense_doc_ids`                 | ✅                   |
-| RRF 병합                          | `retrieval.rrf_score`                            | ✅                   |
-| HyDE 조건부 검색                  | `retrieval.hybrid_search_with_hyde`              | ✅                   |
-| Reranking (Soft Voting)           | `reranker.py`                                    | ✅                   |
-| LLM 응답 생성 (CRAG + Self-check) | `generator.py`                                   | ✅                   |
-| 치챗 응답 생성                    | `generator.generate_chitchat`                    | ✅                   |
-| Pseudo Labeling                   | `pseudo_label.py`                                | ✅                   |
-| VRAM 순차 언로드                  | `vram.py`                                        | ✅                   |
-| SFT 데이터 생성                   | `scripts/build_sft_data.py`                      | ✅                   |
-| Unsloth SFT 학습 (Qwen3.5-4B)     | `scripts/train_sft.py`                           | ✅ (GPU 환경 필요)   |
-| vLLM 서빙                         | `scripts/serve_vllm.py`                          | ✅ (선택, 별도 venv) |
-| RAGAS 평가                        | `scripts/ragas_eval.py`                          | ✅                   |
-| 대회 변형 MAP                     | `competition_metrics.calc_map`                   | ✅                   |
-| 제출 파일 생성·검증               | `export_submission.py`, `validate_submission.py` | ✅                   |
-| 단위 테스트 (54개)                | `tests/`                                         | ✅                   |
+| 단계                                               | 모듈                                                                 | 상태                                        |
+| -------------------------------------------------- | -------------------------------------------------------------------- | ------------------------------------------- |
+| 문서 전처리                                        | `preprocess.py`                                                      | ✅                                          |
+| 치챗/과학 분류                                     | `query_rewrite.is_science_question`                                  | ✅                                          |
+| 쿼리 재작성 (멀티턴)                               | `query_rewrite.build_search_query`                                   | ✅                                          |
+| alt_query (3축 RRF)                                | `query_rewrite.generate_alt_query`                                   | ✅                                          |
+| Solar Pro / OpenAI Chat 브릿지                     | `llm_openai_chat.OpenAIChatCompletionLLM`                            | ✅ (`export_submission --phase*-api solar`) |
+| ES 색인 (Nori + 사용자 사전)                       | `es_util.py`, `scripts/index_es.py`                                  | ✅                                          |
+| Qdrant 벡터 색인                                   | `embeddings.py`, `scripts/index_qdrant.py`                           | ✅                                          |
+| BM25 검색                                          | `retrieval.es_bm25_doc_ids`                                          | ✅                                          |
+| Dense 검색                                         | `retrieval.qdrant_dense_doc_ids`                                     | ✅                                          |
+| RRF 병합                                           | `retrieval.rrf_score`                                                | ✅                                          |
+| HyDE 조건부 검색                                   | `retrieval.hybrid_search_with_hyde`                                  | ✅                                          |
+| Reranking (Soft Voting)                            | `reranker.py`                                                        | ✅                                          |
+| LLM 응답 생성 (CRAG + Self-check)                  | `generator.py`                                                       | ✅                                          |
+| 치챗 응답 생성                                     | `generator.generate_chitchat`                                        | ✅                                          |
+| Pseudo Labeling                                    | `pseudo_label.py`                                                    | ✅                                          |
+| VRAM 순차 언로드                                   | `vram.py`                                                            | ✅                                          |
+| ES 사용자사전·동의어 보완 (F-2c)                   | `scripts/index_es.py --recreate`                                     | ✅                                          |
+| Embedding Instruction 강화 + Qdrant 재인덱싱 (F-3) | `scripts/index_qdrant.py --force`                                    | ✅                                          |
+| Multi-field boost 튜닝 (G-4)                       | `--multi-field` (Title^2 / Keywords^1.5 / Summary^1.2 / Content^3.5) | ✅ MAP=0.9250                               |
+| SFT 데이터 생성                                    | `scripts/build_sft_data.py`                                          | ✅                                          |
+| Unsloth SFT 학습 (Qwen3.5-4B)                      | `scripts/train_sft.py`                                               | ✅ (GPU 환경 필요)                          |
+| Reranker SFT 재학습 (B-3c)                         | `scripts/train_reranker.py` (negatives 오탐 226개 제거 후)           | ✅ 완료 / 결과 미확인                       |
+| vLLM 서빙                                          | `scripts/serve_vllm.py`                                              | ✅ (선택, 별도 venv)                        |
+| RAGAS 평가                                         | `scripts/ragas_eval.py`                                              | ✅                                          |
+| 대회 변형 MAP                                      | `competition_metrics.calc_map`                                       | ✅                                          |
+| 제출 파일 생성·검증                                | `export_submission.py`, `validate_submission.py`                     | ✅                                          |
+| 단위 테스트 (54개)                                 | `tests/`                                                             | ✅                                          |
 
 ---
 
@@ -222,8 +230,8 @@ A. 네, 220건 중 약 20건이 과학과 무관한 일상 대화입니다. Phas
 **Q. RAGAS Self-check에 어떤 API 키가 필요한가요?**  
 A. `GOOGLE_API_KEY`(Google AI Studio) 또는 `OPENAI_API_KEY` 중 하나를 `.env`에 설정하면 됩니다. `GOOGLE_API_KEY`가 있으면 **Gemini 2.0 Flash**가 우선 사용됩니다 (무료 티어 제공). OpenAI 쿼터 초과 시에도 Google AI Studio로 대체하거나, 둘 다 없을 때는 `.env`에 `DISABLE_SELFCHECK=1`을 추가해 Self-check를 비활성화합니다.
 
-**Q. Phase 0·최종 답변을 Solar Pro API만 쓰고 싶어요.**  
-A. `export_submission.py`에 `--phase0-api solar --phase3-api solar`를 지정합니다. `.env`에 `SOLAR_API_KEY`가 필요합니다(Upstage). Phase 1(임베딩)·Phase 2(Reranker)는 기존과 같이 GPU·로컬 모델을 사용합니다. 자세한 옵션은 `docs/OPERATION.md` 8절을 참고하세요.
+**Q. Phase 0·Phase 3에서 어떤 LLM API를 사용하나요?**  
+A. Phase 0(쿼리 재작성·HyDE) 및 Phase 3(답변 생성·`--llm-select` 문서 선별)은 **Solar Pro API**를 사용합니다(`--phase0-api solar --phase3-api solar`). `.env`에 `SOLAR_API_KEY`가 필요합니다(Upstage). Phase 1(임베딩)·Phase 2(Reranker)는 GPU·로컬 모델을 사용합니다.
 
 **Q. 변형 MAP이 뭔가요?**  
 A. 리더보드 채점은 `topk` 상위 3개 docid와 정답 set의 AP를 평균냅니다. GT가 빈 케이스(검색 불필요)는 `topk`가 비어 있으면 만점(1), 아니면 0점입니다.

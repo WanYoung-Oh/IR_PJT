@@ -7,8 +7,8 @@ A-1 데이터(sft_doc_qa.jsonl)를 파싱하여 (query, positive_docid, negative
 처리 흐름:
   sft_doc_qa.jsonl 각 행 →
     user 메시지에서 질문 파싱
-    [문서 N] 블록 전체 파싱 → documents.jsonl과 매칭 → 첫 문서 = positive docid
-    BM25 검색 → negative (positive 및 프롬프트 내 다른 문서 docid 제외)
+    user 메시지 첫 번째 문서 내용 파싱 → documents.jsonl과 매칭 → positive docid
+    BM25 검색 → negative docid 목록 (positive 제외)
     → artifacts/reranker_triplets.jsonl
 
 사용 예시:
@@ -16,6 +16,7 @@ A-1 데이터(sft_doc_qa.jsonl)를 파싱하여 (query, positive_docid, negative
       --config config/default.yaml \\
       --sft-data artifacts/sft_doc_qa.jsonl \\
       --output artifacts/reranker_triplets.jsonl
+VERSION: v1
 """
 from __future__ import annotations
 
@@ -46,60 +47,35 @@ logger = logging.getLogger(__name__)
 _DOC_PATTERN = re.compile(r"\[문서 \d+\]\s*(.*?)(?=\n\n\[문서 |\n\n질문: |$)", re.DOTALL)
 
 
-def _parse_user_message(user_content: str) -> tuple[str, list[str]]:
-    """user 메시지에서 (질문, [문서 1]… 순서의 문서 본문 목록)을 파싱한다."""
+def _parse_user_message(user_content: str) -> tuple[str, str]:
+    """user 메시지에서 (질문, 첫 번째 문서 본문)을 파싱한다."""
     question = ""
     if "\n\n질문: " in user_content:
         question = user_content.split("\n\n질문: ", 1)[-1].strip()
 
-    bodies = [m.strip() for m in _DOC_PATTERN.findall(user_content)]
-    return question, bodies
+    first_doc = ""
+    matches = _DOC_PATTERN.findall(user_content)
+    if matches:
+        first_doc = matches[0].strip()
+
+    return question, first_doc
 
 
-def _build_doc_lookup(
-    doc_path: Path, prefix_len: int = 200
-) -> tuple[dict[str, str], dict[str, str]]:
-    """전문 일치 및 prefix가 코퍼스에서 유일할 때만 쓰는 역매핑.
-
-    앞 N글자가 여러 문서에서 공유되면 prefix 맵에 넣지 않아 오매칭을 피한다.
-    """
-    rows: list[tuple[str, str]] = []
+def _build_content_index(doc_path: Path, prefix_len: int = 50) -> dict[str, str]:
+    """documents.jsonl 본문 앞 prefix_len자 → docid 역매핑을 반환한다."""
+    index: dict[str, str] = {}
     for doc in iter_jsonl(doc_path):
         content = doc.get("content", "").strip()
-        if content:
-            rows.append((content, doc["docid"]))
-
-    exact: dict[str, str] = {c: did for c, did in rows}
-
-    prefix_counts: dict[str, int] = {}
-    for c, _ in rows:
-        p = c[:prefix_len]
-        if p:
-            prefix_counts[p] = prefix_counts.get(p, 0) + 1
-
-    prefix_unique: dict[str, str] = {}
-    for c, did in rows:
-        p = c[:prefix_len]
-        if p and prefix_counts[p] == 1:
-            prefix_unique[p] = did
-
-    return exact, prefix_unique
+        key = content[:prefix_len]
+        if key:
+            index[key] = doc["docid"]
+    return index
 
 
-def _match_docid(
-    body: str,
-    exact: dict[str, str],
-    prefix_unique: dict[str, str],
-    prefix_len: int = 200,
-) -> str | None:
-    """본문 전문 일치 우선, 없으면 유일한 prefix로 docid 조회."""
-    b = body.strip()
-    if not b:
-        return None
-    if b in exact:
-        return exact[b]
-    key = b[:prefix_len]
-    return prefix_unique.get(key)
+def _match_docid(first_doc: str, content_index: dict[str, str], prefix_len: int = 50) -> str | None:
+    """first_doc 앞 prefix_len자로 docid를 찾는다. 없으면 None."""
+    key = first_doc[:prefix_len]
+    return content_index.get(key)
 
 
 def main() -> None:
@@ -126,12 +102,8 @@ def main() -> None:
     es_index = cfg["elasticsearch"]["index"]
 
     logger.info("documents.jsonl 로드 및 content 역매핑 구축 중…")
-    exact_index, prefix_index = _build_doc_lookup(doc_path)
-    logger.info(
-        "역매핑: 전문 키 %d건, 유일 prefix 키 %d건",
-        len(exact_index),
-        len(prefix_index),
-    )
+    content_index = _build_content_index(doc_path)
+    logger.info("역매핑 구축 완료: %d건", len(content_index))
 
     # 이어받기: 기존 출력 행 수 확인
     existing = 0
@@ -156,36 +128,25 @@ def main() -> None:
             user_content = next(
                 (m["content"] for m in msgs if m["role"] == "user"), ""
             )
-            question, doc_bodies = _parse_user_message(user_content)
+            question, first_doc = _parse_user_message(user_content)
 
             if not question:
                 skip_no_q += 1
                 continue
 
-            if not doc_bodies:
-                skip_no_pos += 1
-                continue
-
-            positive_id = _match_docid(doc_bodies[0], exact_index, prefix_index)
+            positive_id = _match_docid(first_doc, content_index)
             if not positive_id:
                 skip_no_pos += 1
-                logger.debug("positive 매칭 실패: %s…", doc_bodies[0][:40])
+                logger.debug("positive 매칭 실패: %s…", first_doc[:40])
                 continue
 
-            context_ids: set[str] = {positive_id}
-            for body in doc_bodies[1:]:
-                did = _match_docid(body, exact_index, prefix_index)
-                if did:
-                    context_ids.add(did)
-
-            # BM25로 negative 후보 검색 (프롬프트 문서·positive 제외 후 top_k_neg 채울 만큼 여유)
-            fetch_k = args.top_k_neg + max(15, len(context_ids) * 3)
+            # BM25로 negative 후보 검색
             retrieved = es_bm25_doc_ids(
                 es, es_index, question,
-                top_k=fetch_k,
+                top_k=args.top_k_neg + 5,
                 use_multi_field=args.use_multi_field,
             )
-            negatives = [d for d in retrieved if d not in context_ids][: args.top_k_neg]
+            negatives = [d for d in retrieved if d != positive_id][: args.top_k_neg]
             if not negatives:
                 skip_no_neg += 1
                 continue

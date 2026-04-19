@@ -17,7 +17,7 @@ def _bm25_query_body(query: str, use_multi_field: bool) -> dict[str, Any]:
         return {
             "multi_match": {
                 "query": query,
-                "fields": ["title^2", "keywords^1.5", "summary^1.2", "content^3.3"],
+                "fields": ["title^2", "keywords^1.5", "summary^1.5", "content^3.5"],
                 "type": "best_fields",
             }
         }

@@ -89,11 +89,11 @@ flowchart TD
 
 | 단계 | 스크립트 상 이름 | 핵심 동작 |
 | --- | --- | --- |
-| Phase 0 | `run_pipeline` 앞부분 | 캐시 / `--skip-rewrite` / LLM 경로 분기 → 과학이면 standalone·HyDE·alt_query → `phase0_queries.csv` 조건부 저장 |
+| Phase 0 | `run_pipeline` 앞부분 | 캐시 / `--skip-rewrite` / **Solar Pro API** 분기 → 과학이면 standalone·HyDE·alt_query → `phase0_queries.csv` 조건부 저장 |
 | Phase 1 | Hybrid Retrieval | `--skip-dense`면 BM25만; 아니면 임베딩+BM25+Dense 가중 RRF. standalone·hyde·alt로 검색 축 1~3개 `rrf_score` |
 | Phase 2 | Reranking | `rerank_with_crossencoder` + `soft_voting_rerank` → `topk_ids` (기본 상위 10) |
-| Phase 2.5 | 선택 | `--llm-select`일 때만 `_llm_select_docs`; `--skip-generation`이면 비활성 |
-| Phase 3 | 생성 | `--skip-generation`이면 placeholder; 아니면 `_load_reasoning_llm(phase3_backend)`로 치챗·과학 답변 |
+| Phase 2.5 | 선택 | `--llm-select`일 때만 `_llm_select_docs` (**Solar Pro API**); `--skip-generation`이면 비활성 |
+| Phase 3 | 생성 | `--skip-generation`이면 placeholder; 아니면 **Solar Pro API**로 치챗·과학 답변 |
 
 **치챗**: Phase 1·2에서 검색·리랭킹 생략. Phase 3에서만 `generate_chitchat`.
 
@@ -263,8 +263,7 @@ OPENAI_API_KEY=sk-...
 # 둘 다 없거나 Self-check를 완전히 끄려면:
 # DISABLE_SELFCHECK=1
 
-# Upstage Solar Pro — SFT 답변 생성(build_sft_data) · 제출 파이프라인 Phase0/3 API 모드
-#   export_submission.py --phase0-api solar --phase3-api solar
+# Upstage Solar Pro — Phase 0·3 LLM API (필수) · SFT 답변 생성(build_sft_data)
 SOLAR_API_KEY=up_...
 
 HF_TOKEN=hf_...       # HuggingFace private 모델 접근 시 필요
@@ -371,15 +370,23 @@ ps aux | grep qdrant
 ### 4-1. 희소 검색 (ES BM25 + Nori)
 
 ```bash
-# 최초 색인
+# 최초 색인 (기본)
 python scripts/index_es.py --config config/default.yaml
 
 # 인덱스 설정 변경 후 재색인 (동의어 사전·분석기 변경 시 --recreate 필수)
 python scripts/index_es.py --config config/default.yaml --recreate
+
+# 메타·동의어·LMJelinekMercer 포함 전체 재인덱싱 (F-2b/F-2c 보완 버전 — 현재 적용 상태)
+python scripts/index_es.py --config config/default.yaml \
+  --metadata artifacts/doc_metadata.jsonl \
+  --synonyms artifacts/science_synonyms.txt \
+  --lm-jelinek-mercer --recreate
 ```
 
 > `--recreate` 없이 실행하면 기존 인덱스를 그대로 사용합니다(중복 색인 방지).  
 > 분석기·동의어(`KOREAN_SYNONYMS`)·사용자 사전 변경 시 반드시 `--recreate`로 재생성하세요.
+>
+> **F-2c 사용자사전·동의어 보완 (2026-04-19 적용)**: 주요 검색 오류 케이스에서 발견된 미등록 전문어·표기 변이를 `artifacts/user_dict.txt` 및 `artifacts/science_synonyms.txt`에 추가 후 재인덱싱 완료.
 
 ### 4-2. (선택) 사용자 사전 생성 — MeCab 필요
 
@@ -396,6 +403,8 @@ python scripts/index_qdrant.py --config config/default.yaml
 # 기존 컬렉션 재생성: --force
 python scripts/index_qdrant.py --config config/default.yaml --force
 ```
+
+> **F-3 Embedding Instruction 도메인 강화 (2026-04-19 적용)**: Qwen3-Embedding-8B의 Instruction 프롬프트를 한국어 중고등학교 수준 과학 문서 도메인에 최적화하여 변경 후 `--force`로 4,272건 전체 재인덱싱 완료. Dense 검색 recall 향상 목적.
 
 ---
 
@@ -557,25 +566,17 @@ python scripts/export_submission.py --placeholder --dummy-topk --config config/d
 ### 8-2. 실제 파이프라인 실행
 
 ES + Qdrant 색인 완료 + GPU 환경에서 **py310** 가상환경으로 실행합니다.  
-vLLM 서버는 **불필요** — 4-Phase 순차 로드로 24GB VRAM 내에서 동작합니다.
+vLLM 서버는 **불필요** — 4-Phase 순차 로드로 24GB VRAM 내에서 동작합니다.  
+Phase 0·3은 **Solar Pro API**를 사용합니다(`.env`에 `SOLAR_API_KEY` 필요).
 
 ```bash
 # config/default.yaml의 vllm 섹션이 주석 처리된 상태여야 합니다
 python scripts/export_submission.py \
   --pipeline \
   --config config/default.yaml \
+  --phase0-api solar --phase3-api solar \
   --top-k-retrieve 20 \
   --top-k-rerank 10
-```
-
-**Phase 0·3을 Solar Pro API만 사용** (로컬 HuggingFace LLM 미로드 — `SOLAR_API_KEY` 필요, `requirements-train.txt`의 `openai` 패키지 사용):
-
-```bash
-python scripts/export_submission.py \
-  --pipeline \
-  --config config/default.yaml \
-  --phase0-api solar \
-  --phase3-api solar
 ```
 
 **Phase 0 캐시(Solar 생성 CSV) + 다축 RRF 가중** (리더보드 기록 예: `phase0_queries_llm_select_total_solar.csv` + `--rrf-weights 0.5,0.25,0.25` → MAP/MRR 약 0.8386/0.8424 — [`PLAN_UP.md`](PLAN_UP.md) 실험 G-2):
@@ -597,6 +598,7 @@ python scripts/export_submission.py \
 python scripts/export_submission.py \
   --pipeline \
   --config config/default.yaml \
+  --phase0-api solar --phase3-api solar \
   --multi-field \
   --rrf-weights 0.4,0.3,0.3 \
   --bm25-weight 0.7 --dense-weight 0.3 \
@@ -605,10 +607,29 @@ python scripts/export_submission.py \
   -o artifacts/sample_submission_g3_rerank_only.csv
 ```
 
+**[현재 최고 성능] F-2c·F-3 재인덱싱 + multi-field boost 튜닝** (리더보드 기록: [`PLAN_UP.md`](PLAN_UP.md) 실험 **G-4** — MAP/MRR **0.9250 / 0.9273**):
+
+```bash
+# ES 재인덱싱(F-2c) + Qdrant 재인덱싱(F-3) 완료 상태에서 실행
+python scripts/export_submission.py \
+  --pipeline \
+  --config config/default.yaml \
+  --phase0-api solar --phase3-api solar \
+  --multi-field \
+  --rrf-weights 0.4,0.3,0.3 \
+  --bm25-weight 0.7 --dense-weight 0.3 \
+  --top-k-retrieve 30 \
+  --top-k-rerank 15 \
+  -o artifacts/sample_submission_g4.csv
+```
+
+> G-3 대비 변경점: ES 사용자사전·동의어 보완(F-2c) + Embedding Instruction 강화 후 Qdrant 재인덱싱(F-3) + `Content` 필드 boost `^1.2 → ^3.5` 상향.  
+> `--multi-field` 적용 시 boost: `Title^2 / Keywords^1.5 / Summary^1.2 / Content^3.5`
+
 | 옵션 | 기본값 | 설명 |
 | --- | --- | --- |
-| `--phase0-api` | `hf` | `hf` = `config`의 로컬 LLM · `solar` = Solar Pro (standalone·HyDE·alt_query·과학 판별) |
-| `--phase3-api` | `hf` | `hf` = 로컬 LLM · `solar` = Solar Pro (`answer` 생성). `--llm-select` 문서 선별에도 동일 백엔드 적용 |
+| `--phase0-api` | `solar` | `solar` = **Solar Pro API** (standalone·HyDE·alt_query·과학 판별); `hf` = 로컬 HuggingFace LLM |
+| `--phase3-api` | `solar` | `solar` = **Solar Pro API** (`answer` 생성 · `--llm-select` 문서 선별); `hf` = 로컬 HuggingFace LLM |
 | `--phase0-cache` | 없음 | 지정 CSV로 Phase 0 생략 (`artifacts/phase0_queries.csv` 등). **3축 RRF**를 쓰려면 CSV에 `alt_query` 열이 채워진 최신 파일 사용 |
 | `--rrf-weights` | 없음(균등 1,1,1) | Phase 1에서 standalone / HyDE / alt_query **다축 RRF 가중치** (쉼표로 3개). 예: `0.5,0.25,0.25`. 2축일 때는 존재하는 축에만 대응 |
 | `--llm-select` | 끔 | Phase 2.5 LLM 문서 선별 |
@@ -620,10 +641,10 @@ python scripts/export_submission.py \
 
 | Phase | 모델 / 백엔드 | 작업                                                                    | 대상   | VRAM / 비고 |
 | ----- | ------------- | ----------------------------------------------------------------------- | ------ | ----- |
-| 0     | 로컬 LLM 또는 **Solar API** | 치챗/과학 분류 + 쿼리 재작성 + HyDE + **alt_query** → `phase0_queries.csv` | 전체   | 로컬 시 ~8GB · API 시 GPU 없음 |
+| 0     | **Solar Pro API** | 치챗/과학 분류 + 쿼리 재작성 + HyDE + **alt_query** → `phase0_queries.csv` | 전체   | GPU 없음 (API 호출) |
 | 1     | Embedding 8B | BM25 + Dense → 3축 RRF(k=20) Top-20                                     | 과학만 | ~16GB |
 | 2     | Reranker 8B  | Cross-Encoder + Soft Voting → Top-N                                     | 과학만 | ~16GB |
-| 3     | 로컬 LLM 또는 **Solar API** | CRAG + Self-check (과학) / 일상 대화 (치챗)                             | 전체   | 로컬 시 ~8GB · API 시 GPU 없음 |
+| 3     | **Solar Pro API** | CRAG + Self-check (과학) / 일상 대화 (치챗)                             | 전체   | GPU 없음 (API 호출) |
 
 각 Phase 종료 후 모델을 GPU에서 언로드(`vram.unload_model`)하여 다음 Phase를 위한 VRAM을 확보합니다.
 
@@ -728,10 +749,19 @@ python -m pytest tests/ --cov=ir_rag --cov-report=term-missing
 | `qdrant`        | `url`, `collection`, `vector_size`           |
 | `paths`         | `documents`, `eval`, `user_dict_out`         |
 | `embedding`     | `model_name`, `trust_remote_code`            |
-| `reranker`      | `model_name` (4B ↔ 8B 전환)                  |
+| `reranker`      | `model_name` (기본 `Qwen/Qwen3-Reranker-8B` ↔ B-3c 파인튜닝 모델 전환) |
 | `vllm`          | `url`, `model_name` (서버 기동 후 주석 해제) |
 | `llm`           | `model_name`, `checkpoint`, `max_new_tokens`   |
 | (CLI)           | Phase 0·3 API 모드: `export_submission.py --phase0-api solar --phase3-api solar` — `.env`에 `SOLAR_API_KEY` |
+
+**B-3c Reranker 파인튜닝 모델 전환** (negatives 오탐 226개 제거 후 재학습 — 결과 미확인):
+
+```yaml
+# config/default.yaml
+reranker:
+  model_name: "artifacts/qwen3-reranker-8b-science"
+  trust_remote_code: true
+```
 
 ---
 
@@ -752,7 +782,7 @@ ES + Qdrant 색인이 완료된 상태에서 결과를 개선하거나 처음부
                                                                                │
   Step 1. 전체 파이프라인 실행                                                  │
   python scripts/export_submission.py --pipeline                               │
-      # Phase 0·3 API: --phase0-api solar --phase3-api solar                  │
+      --phase0-api solar --phase3-api solar                                    │
       → artifacts/phase0_queries.csv  (Phase 0 분류·재작성·HyDE·alt_query)     │
       → artifacts/sample_submission.csv  (최종 제출 파일 초안)                  │
                           │                                                    │
