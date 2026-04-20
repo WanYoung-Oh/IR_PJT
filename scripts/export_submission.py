@@ -56,6 +56,9 @@ from ir_rag.vram import unload_model
 
 logger = logging.getLogger(__name__)
 
+# Phase 2.5: 리랭커 topk_ids 중 LLM 선별에만 넘기는 상위 슬롯 수 (전문 프롬프트로 토큰 부담 완화)
+_LLM_SELECT_RERANK_POOL = 5
+
 
 def _configure_reproducibility(seed: int) -> None:
     """임베딩·리랭커 등 PyTorch 연산 전에 호출한다.
@@ -104,13 +107,14 @@ def _llm_select_docs(
 ) -> list[str]:
     """Phase 2.5: LLM 프롬프트로 top-k 문서를 선별한다.
 
-    Reranker 점수가 놓치는 의미적 관련성을 LLM이 포착.
-    파싱 실패 또는 선별 수 부족 시 candidate_ids[:top_k] 폴백.
+    ``candidate_ids`` 는 보통 리랭커 상위 ``_LLM_SELECT_RERANK_POOL`` 슬롯만 넘긴다.
+    각 후보는 ``doc_map`` 의 **전체 본문**을 프롬프트에 포함한다 (스니펫 없음).
+    파싱 실패 또는 선별 수 부족 시 ``candidate_ids[:top_k]`` 폴백.
 
     Parameters
     ----------
     candidate_ids:
-        Reranker top-k 결과 docid 목록.
+        Reranker 순서가 반영된 docid 목록 (상위 N개만 호출부에서 잘라 넣음).
     doc_map:
         docid → 본문 매핑.
     llm:
@@ -118,16 +122,19 @@ def _llm_select_docs(
     """
     import re
 
-    doc_lines = []
     valid_ids = [d for d in candidate_ids if d in doc_map]
+    doc_blocks: list[str] = []
     for i, did in enumerate(valid_ids, 1):
-        snippet = doc_map[did][:250].replace("\n", " ")
-        doc_lines.append(f"[문서 {i}] {snippet}")
-    doc_list = "\n".join(doc_lines)
+        body = (doc_map.get(did) or "").strip()
+        if not body:
+            body = "[내용 없음]"
+        doc_blocks.append(f"[문서 {i}]\n{body}")
+    doc_list = "\n\n---\n\n".join(doc_blocks)
 
     prompt = (
         f"질문: {query}\n\n"
-        f"아래 문서 중 질문에 가장 정확하게 답할 수 있는 문서 {top_k}개를 선택하세요.\n"
+        f"아래는 후보 문서 {len(valid_ids)}개입니다. [문서 i] 번호는 리랭커 상위 순서와 같습니다.\n"
+        f"각 본문 전체를 읽고, 질문에 가장 정확하게 답할 수 있는 문서 {top_k}개를 고르세요.\n"
         f"문서 번호만 콤마로 구분하여 출력하세요. 예: 1, 3, 5\n\n"
         f"{doc_list}\n\n"
         f"선택한 문서 번호 ({top_k}개):"
@@ -190,7 +197,7 @@ def run_pipeline(
       Phase 0.   LLM 로드 → 쿼리 재작성 + HyDE doc/alt_query 생성 → 언로드
       Phase 1.   임베딩 모델 로드 → BM25+Dense RRF(k=20) → 언로드
       Phase 2.   Reranker 로드 → 전체 리랭킹 → 언로드
-      Phase 2.5. (llm_select=True) LLM 로드 → top-k 문서 선별 → 언로드
+      Phase 2.5. (llm_select=True) LLM 로드 → 리랭커 상위 N개 전문으로 top-k 선별 → 언로드
       Phase 3.   LLM 로드 → 전체 답변 생성 → 언로드  ← skip_generation=True 시 생략
 
     Parameters
@@ -203,7 +210,8 @@ def run_pipeline(
         topk 문서 선별에만 집중하는 검색 실험 시 사용. 답변은 placeholder로 대체.
         Phase 0도 --phase0-cache와 함께 사용하면 LLM 로드 없이 검색+재순위만 실행.
     llm_select:
-        True 이면 Phase 2.5를 활성화한다. Reranker 이후 LLM이 최종 문서를 선별한다.
+        True 이면 Phase 2.5를 활성화한다. 리랭커 상위 ``_LLM_SELECT_RERANK_POOL``개의
+        전체 본문만 LLM에 넘겨 최종 문서를 선별한다.
         skip_generation=True 시 자동으로 비활성화된다.
     use_multi_field:
         True 이면 BM25 검색 시 title/keywords/summary/content 멀티필드 쿼리를 사용한다.
@@ -442,15 +450,16 @@ def run_pipeline(
             if not r["is_science"] or not r["topk_ids"]:
                 continue
             question = r["msg"][-1]["content"]
+            pool_ids = r["topk_ids"][:_LLM_SELECT_RERANK_POOL]
             selected = _llm_select_docs(
                 query=question,
-                candidate_ids=r["topk_ids"],
+                candidate_ids=pool_ids,
                 doc_map=doc_map,
                 llm=llm_sel,
                 top_k=top_k_submit,
             )
             r["topk_ids_selected"] = selected
-            print(f"  [{r['eid']}] {r['topk_ids'][:3]} → {selected}")
+            print(f"  [{r['eid']}] llm_pool{len(pool_ids)} {pool_ids[:3]}… → {selected}")
         llm_sel = unload_model(llm_sel)
         print("LLM(선별) 언로드 완료\n")
     else:
@@ -683,7 +692,7 @@ def main() -> None:
     parser.add_argument("--phase0-cache", metavar="CSV",
                         help="Phase 0 캐시 CSV 경로 지정 시 Phase 0을 건너뛰고 해당 파일로 Phase 1~3 실행")
     parser.add_argument("--llm-select", action="store_true",
-                        help="Phase 2.5 활성화: Reranker 이후 LLM이 최종 top-k 문서를 선별")
+                        help="Phase 2.5 활성화: 리랭커 상위 5개 본문 전체를 LLM에 주고 최종 top-k 선별")
     parser.add_argument("--multi-field", action="store_true",
                         help="BM25 검색 시 title/keywords/summary/content 멀티필드 쿼리 사용 (F-2 색인 후)")
     parser.add_argument("--skip-generation", action="store_true",

@@ -26,7 +26,7 @@ embedding:
 # 초반 실험: Qwen/Qwen3-Reranker-4B (~10GB)
 # 최종 제출: Qwen/Qwen3-Reranker-8B (~18GB)
 reranker:
-  model_name: "artifacts/qwen3-reranker-8b-science-v2"
+  model_name: "artifacts/qwen3-reranker-8b-science"
   trust_remote_code: true # Qwen 모델은 true 필요
 
 # vLLM 서빙 URL (선택) — scripts/serve_vllm.py 기동 후 설정
