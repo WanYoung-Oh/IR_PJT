@@ -117,7 +117,9 @@ def rerank_with_crossencoder(
         ).to(device)
         with torch.no_grad():
             logits = model(**enc).logits
+            
             logits = logits / 3. # temperature = 0.333
+
             # 이진 분류(관련/비관련) 모델: logit[:, 1] 또는 sigmoid(logit).squeeze()
             if logits.shape[-1] == 2:
                 batch_scores = torch.softmax(logits, dim=-1)[:, 1].cpu().tolist()
