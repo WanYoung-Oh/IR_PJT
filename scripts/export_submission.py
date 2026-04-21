@@ -164,6 +164,36 @@ def _llm_select_docs(
     return valid_ids[:top_k]
 
 
+def _dump_phase2_topk(
+    rerank_results: list[dict],
+    eid: int,
+    path: Path,
+    *,
+    skip_generation: bool,
+    llm_select_after_gate: bool,
+) -> None:
+    """Phase 2 직후 특정 eval_id의 topk_ids 앞 5개를 JSON으로 저장한다."""
+    import json
+
+    for r in rerank_results:
+        if r.get("eid") != eid:
+            continue
+        path.parent.mkdir(parents=True, exist_ok=True)
+        topk = r.get("topk_ids") or []
+        payload = {
+            "eval_id": eid,
+            "topk_ids_first5": topk[:5],
+            "meta": {
+                "skip_generation": skip_generation,
+                "llm_select_effective_next": llm_select_after_gate,
+            },
+        }
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        print(f"[dump-phase2] eval_id={eid} → {path}")
+        return
+    logger.warning("[dump-phase2] eval_id=%s 를 rerank_results에서 찾지 못함", eid)
+
+
 def _load_reasoning_llm(cfg: dict, backend: str):
     """Phase 0 / 2.5 / 3 공통: 로컬 HF 또는 Solar Pro API."""
     if backend == "solar":
@@ -190,6 +220,9 @@ def run_pipeline(
     phase3_backend: str = "hf",
     axis_rrf_weights: tuple[float, float, float] | None = None,
     seed: int = 42,
+    dump_phase2_eid: int | None = None,
+    dump_phase2_path: Path | None = None,
+    retrieval_only_llm_select: bool = False,
 ) -> list[dict]:
     """전체 RAG 파이프라인을 실행하여 제출 행 목록을 반환한다.
 
@@ -212,7 +245,8 @@ def run_pipeline(
     llm_select:
         True 이면 Phase 2.5를 활성화한다. 리랭커 상위 ``_LLM_SELECT_RERANK_POOL``개의
         전체 본문만 LLM에 넘겨 최종 문서를 선별한다.
-        skip_generation=True 시 자동으로 비활성화된다.
+        skip_generation=True 이면 기본적으로 비활성화된다.
+        retrieval_only_llm_select=True 이면 skip_generation과 함께 켤 수 있다.
     use_multi_field:
         True 이면 BM25 검색 시 title/keywords/summary/content 멀티필드 쿼리를 사용한다.
         F-2 메타 색인 완료 후 활성화한다.
@@ -439,10 +473,21 @@ def run_pipeline(
     reranker = unload_model(reranker)
     print("Reranker 언로드 완료\n")
 
+    llm_select_effective = llm_select
+    if skip_generation and not retrieval_only_llm_select:
+        llm_select_effective = False
+
+    if dump_phase2_eid is not None and dump_phase2_path is not None:
+        _dump_phase2_topk(
+            rerank_results,
+            dump_phase2_eid,
+            dump_phase2_path,
+            skip_generation=skip_generation,
+            llm_select_after_gate=llm_select_effective,
+        )
+
     # ── Phase 2.5: LLM 최종 문서 선별 (선택) ────────────────────────────────
-    if skip_generation:
-        llm_select = False  # 생성 생략 시 선별도 비활성화
-    if llm_select:
+    if llm_select_effective:
         print("=== Phase 2.5: LLM 문서 선별 ===")
         print("LLM 로드 중 (문서 선별용) …")
         llm_sel = _load_reasoning_llm(cfg, phase3_backend)
@@ -723,10 +768,33 @@ def main() -> None:
         default=42,
         help="--pipeline 시 random/NumPy/torch 시드 및 cuDNN 결정적 모드 (기본 42).",
     )
+    parser.add_argument(
+        "--dump-phase2-eid",
+        type=int,
+        default=None,
+        metavar="EID",
+        help="Phase 2 직후 해당 eval_id의 topk_ids 상위 5개를 --dump-phase2-file에 JSON 저장",
+    )
+    parser.add_argument(
+        "--dump-phase2-file",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="--dump-phase2-eid 와 함께 사용 (미지정 시 artifacts/phase2_dump_eid{EID}.json)",
+    )
+    parser.add_argument(
+        "--retrieval-only-llm-select",
+        action="store_true",
+        help="--skip-generation 과 함께 쓸 때 Phase 2.5(--llm-select)는 실행하고 Phase 3만 생략",
+    )
     args = parser.parse_args()
 
     if not args.placeholder and not args.pipeline:
         parser.error("--placeholder 또는 --pipeline 중 하나를 지정하세요.")
+    if args.retrieval_only_llm_select and not args.skip_generation:
+        parser.error("--retrieval-only-llm-select 는 --skip-generation 과 함께 쓰세요.")
+    if args.retrieval_only_llm_select and not args.llm_select:
+        parser.error("--retrieval-only-llm-select 는 --llm-select 와 함께 쓰세요.")
 
     root = repo_root_from(Path.cwd())
     cfg = load_config(resolve_config_path(root, args.config))
@@ -752,6 +820,12 @@ def main() -> None:
                 axis_rrf_weights = (float(parts[0]), float(parts[1]), float(parts[2]))
             except ValueError as e:
                 parser.error(f"--rrf-weights 파싱 실패: {e}")
+        dump_eid = args.dump_phase2_eid
+        dump_path = args.dump_phase2_file
+        if dump_eid is not None and dump_path is None:
+            dump_path = root / "artifacts" / f"phase2_dump_eid{dump_eid}.json"
+        if dump_path is not None and dump_eid is None:
+            parser.error("--dump-phase2-file 은 --dump-phase2-eid 와 함께 지정하세요.")
         rows_out = run_pipeline(
             cfg, root,
             top_k_retrieve=args.top_k_retrieve,
@@ -769,6 +843,9 @@ def main() -> None:
             phase3_backend=args.phase3_api,
             axis_rrf_weights=axis_rrf_weights,
             seed=args.seed,
+            dump_phase2_eid=dump_eid,
+            dump_phase2_path=dump_path,
+            retrieval_only_llm_select=args.retrieval_only_llm_select,
         )
     else:
         rows_out = []

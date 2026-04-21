@@ -176,7 +176,7 @@ def _build_settings(
         settings["similarity"] = {
             "lm_jelinek_mercer": {
                 "type": "LMJelinekMercer",
-                "lambda": 0.7,
+                "lambda": 0.69,
             }
         }
 
