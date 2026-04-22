@@ -13,7 +13,7 @@
 > **로컬 MAP 한계**: 공개 데이터에 정답 docid(GT)가 없어 로컬 점수는 상대 비교용입니다.  
 > 최종 순위는 제출 후 공식 결과를 기준으로 합니다.
 >
-> **현재 최고 성능 (2026-04-19)**: ES 사용자사전·동의어 보완(F-2c) + Embedding Instruction 도메인 강화 + Qdrant 재인덱싱(F-3) + multi-field boost 튜닝(`Title^2, Keywords^1.5, Summary^1.2, Content^3.5`) → 리더보드 **MAP=0.9250 / MRR=0.9273**
+> **최종 성능 (2026-04-22)**: ES 동의어 사전 한-한 항목 삭제·한-영만 유지 후 재색인(G-5) → 리더보드 **MAP=0.9311 / MRR=0.9333** — 참조 팀(0.9288) 초과. **프로젝트 완료.**
 
 ---
 
@@ -193,9 +193,11 @@ python scripts/validate_submission.py artifacts/sample_submission.csv
 | ES 사용자사전·동의어 보완 (F-2c)                   | `scripts/index_es.py --recreate`                                     | ✅                                          |
 | Embedding Instruction 강화 + Qdrant 재인덱싱 (F-3) | `scripts/index_qdrant.py --force`                                    | ✅                                          |
 | Multi-field boost 튜닝 (G-4)                       | `--multi-field` (Title^2 / Keywords^1.5 / Summary^1.2 / Content^3.5) | ✅ MAP=0.9250                               |
+| ES 동의어 한-한 삭제·한-영만 유지 + 재색인 (G-5)  | `scripts/index_es.py --recreate` (synonyms 정리 후)                  | ✅ **MAP=0.9311 / MRR=0.9333 — 최종 최고** |
+| 메타데이터 프롬프트 개선 + ES 재인덱싱 (I-1)       | `scripts/build_doc_metadata.py` + `index_es.py --recreate`           | ✅ MAP=0.9311 / MRR=0.9333 (변화 없음)     |
 | SFT 데이터 생성                                    | `scripts/build_sft_data.py`                                          | ✅                                          |
 | Unsloth SFT 학습 (Qwen3.5-4B)                      | `scripts/train_sft.py`                                               | ✅ (GPU 환경 필요)                          |
-| Reranker SFT 재학습 (B-3c)                         | `scripts/train_reranker.py` (negatives 오탐 226개 제거 후)           | ✅ 완료 / 결과 미확인                       |
+| Reranker SFT 재학습 (B-3c)                         | `scripts/train_reranker.py` (negatives 오탐 226개 제거 후)           | ✅ 완료 (성능 개선 없음)                    |
 | vLLM 서빙                                          | `scripts/serve_vllm.py`                                              | ✅ (선택, 별도 venv)                        |
 | RAGAS 평가                                         | `scripts/ragas_eval.py`                                              | ✅                                          |
 | 대회 변형 MAP                                      | `competition_metrics.calc_map`                                       | ✅                                          |

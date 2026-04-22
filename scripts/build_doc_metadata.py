@@ -39,7 +39,48 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-_CATEGORIES = ["물리", "화학", "생물", "지구과학", "과학일반", "영양학", "의학", "천문학", "노화의학", "컴퓨터", "전기" "프로그래밍", "사회과학", "기타"]
+_CATEGORIES = [
+    "물리", "화학", "생물", "지구과학",
+    "의학", "영양학", "노화의학",
+    "천문학", "컴퓨터", "전기공학",
+    "사회과학", "과학일반", "기타",
+]
+
+# src 필드 도메인 → category 힌트 매핑
+_SRC_DOMAIN_HINT: dict[str, str] = {
+    "electrical_engineering":       "전기공학",
+    "high_school_physics":          "물리",
+    "college_physics":              "물리",
+    "conceptual_physics":           "물리",
+    "high_school_chemistry":        "화학",
+    "college_chemistry":            "화학",
+    "high_school_biology":          "생물",
+    "college_biology":              "생물",
+    "medical_genetics":             "생물",
+    "virology":                     "생물 또는 의학",
+    "anatomy":                      "의학",
+    "college_medicine":             "의학",
+    "human_sexuality":              "의학",
+    "nutrition":                    "영양학",
+    "human_aging":                  "노화의학",
+    "astronomy":                    "천문학",
+    "computer_security":            "컴퓨터",
+    "college_computer_science":     "컴퓨터",
+    "high_school_computer_science": "컴퓨터",
+    "global_facts":                 "사회과학",
+    "ARC_Challenge":                "과학일반(물리/화학/생물/지구과학 중 내용에 맞게 판단)",
+}
+
+
+def _extract_src_domain(src: str) -> str:
+    """src 문자열에서 도메인 키를 추출한다.
+
+    예: 'ko_mmlu__nutrition__test' → 'nutrition'
+        'ko_ai2_arc__ARC_Challenge__test' → 'ARC_Challenge'
+    """
+    parts = src.split("__")
+    return parts[1] if len(parts) >= 2 else src
+
 
 _META_SYSTEM = (
     "당신은 과학 문서 분석 전문가입니다. "
@@ -49,16 +90,22 @@ _META_SYSTEM = (
 
 _META_USER_TEMPLATE = """다음 과학 문서를 분석하여 JSON 형식으로 메타 정보를 생성하세요.
 
+문서 출처(카테고리 분류 참고용): {domain_hint}
 문서:
 {content}
 
 다음 형식으로 정확히 출력하세요:
 {{
-  "title": "30자 이내의 핵심 제목",
+  "title": "30자 이내의 핵심 제목 (검색 쿼리처럼 간결하게)",
   "keywords": ["키워드1", "키워드2", "키워드3", "키워드4", "키워드5"],
-  "summary": "2~3문장으로 문서의 핵심 내용 요약",
-  "category": "물리|화학|생물|지구과학|영양학|의학|천문학|노화의학|컴퓨터|전기|프로그래밍|사회과학|과학일반|기타 중 하나"
-}}"""
+  "summary": "문서에 명시된 내용만으로 2~3문장 요약 (추론·배경지식 추가 금지)",
+  "category": "물리|화학|생물|지구과학|의학|영양학|노화의학|천문학|컴퓨터|전기공학|사회과학|과학일반|기타 중 하나"
+}}
+
+keywords 작성 기준:
+- 이 문서를 검색할 때 사용할 핵심 용어 위주
+- 문서에 직접 등장하거나 밀접한 전문 용어 우선
+- 한글 표기와 영어 원어가 다른 경우 둘 다 포함 (예: "광합성 photosynthesis")"""
 
 
 def _build_api_client(api: str):
@@ -84,15 +131,20 @@ def _default_model(api: str) -> str:
     return {"solar": "solar-pro", "openai": "gpt-4o-mini", "google": "gemini-2.0-flash"}[api]
 
 
-def _generate_metadata(client, model: str, content: str, retries: int = 2) -> dict | None:
+def _generate_metadata(client, model: str, content: str, src: str = "", retries: int = 2) -> dict | None:
     """문서 하나에 대한 메타 정보를 생성한다. 실패 시 None 반환."""
+    domain = _extract_src_domain(src)
+    domain_hint = _SRC_DOMAIN_HINT.get(domain, "알 수 없음 (내용으로 판단)")
     for attempt in range(retries + 1):
         try:
             resp = client.chat.completions.create(
                 model=model,
                 messages=[
                     {"role": "system", "content": _META_SYSTEM},
-                    {"role": "user", "content": _META_USER_TEMPLATE.format(content=content[:800])},
+                    {"role": "user", "content": _META_USER_TEMPLATE.format(
+                        content=content[:800],
+                        domain_hint=domain_hint,
+                    )},
                 ],
                 max_tokens=256,
                 temperature=0.3,
@@ -103,10 +155,14 @@ def _generate_metadata(client, model: str, content: str, retries: int = 2) -> di
             # 필수 필드 검증
             if not all(k in meta for k in ("title", "keywords", "summary", "category")):
                 raise ValueError(f"필수 필드 누락: {list(meta.keys())}")
-            # keywords가 list인지 확인
+            # keywords 정규화: list가 아니면 변환, 중첩 리스트 flatten
             if not isinstance(meta["keywords"], list):
                 meta["keywords"] = [str(meta["keywords"])]
-            meta["keywords"] = meta["keywords"][:8]  # 최대 8개
+            meta["keywords"] = [
+                str(x)
+                for k in meta["keywords"]
+                for x in (k if isinstance(k, list) else [k])
+            ][:8]  # 최대 8개
             # category 정규화
             if meta["category"] not in _CATEGORIES:
                 meta["category"] = "기타"
@@ -162,7 +218,8 @@ def main() -> None:
                 continue
 
             content = doc.get("content", "")
-            meta = _generate_metadata(client, model, content)
+            src = doc.get("src", "")
+            meta = _generate_metadata(client, model, content, src=src)
 
             if meta is None:
                 failed += 1

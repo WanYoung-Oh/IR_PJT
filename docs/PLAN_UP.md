@@ -1,13 +1,16 @@
 # RAG 파이프라인 개선 계획
 
-> **현재 목표**: MAP 0.85+ 달성 (베이스라인 0.6682 → 참조 팀 0.9288)
-> 검색 품질 개선 → LLM 품질 개선 순으로 진행한다.
+> **최종 결과**: 베이스라인 0.6682 → **MAP=0.9311 / MRR=0.9333** (G-5, 2026-04-22) — 참조 팀(0.9288) 초과. **프로젝트 완료.**
 >
-> **갱신 (2026-04-19)**: ES 사용자 사전·동의어 보완(F-2c) + Embedding Instruction 도메인 강화 후 Qdrant 재인덱싱(F-3) + multi-field boost 튜닝(`Title^2, Keywords^1.5, Summary^1.2, Content^3.5`) → 리더보드 **MAP=0.9250 / MRR=0.9273** (실험 **G-4**, 현재 최고 성능). Reranker SFT 재학습(negatives 오탐 226개 제거, B-3c) 완료 — **결과 미확인**.
+> **갱신 (2026-04-22, 최종)**: 문서 메타데이터 프롬프트 개선(I-1) — `build_doc_metadata.py` 카테고리 버그 수정·src 도메인 힌트·keywords 영어 병기·summary hallucination 방지 적용 후 `doc_metadata_v2.jsonl` 재생성 → ES 재인덱싱 → **MAP=0.9311 / MRR=0.9333** (변화 없음). Phase 0 쿼리 품질 개선 실험(H-2) — ① HyDE 프롬프트 교과서 문체 변경 + 단일턴 standalone 재작성 동시 적용 → **MAP=0.8356** (하락). ② HyDE 프롬프트 단독 변경 → **MAP=0.9250** (하락). 두 변경 모두 롤백. `--llm-select` G-5 인덱스 재실험 → **MAP=0.8 대** (하락). top-k·Reranker 가중치·BM25:Dense 비율 재탐색 모두 G-5 대비 개선 없음. **G-5(MAP=0.9311 / MRR=0.9333)를 최종 제출로 확정.**
+>
+> **갱신 (2026-04-22)**: ES 동의어 사전 대폭 정리 — **한글↔한글 항목 삭제**, **한글↔영어 항목만 유지** 후 **ES 재색인** → G-4와 동일 파이프라인으로 제출( **`--llm-select` 비활성** ) — 리더보드 **MAP=0.9311** (실험 **G-5**, **최고 성능**).
+>
+> **갱신 (2026-04-19)**: ES 사용자 사전·동의어 보완(F-2c) + Embedding Instruction 도메인 강화 후 Qdrant 재인덱싱(F-3) + multi-field boost 튜닝(`Title^2, Keywords^1.5, Summary^1.2, Content^3.5`) → 리더보드 **MAP=0.9250 / MRR=0.9273** (실험 **G-4**). Reranker SFT 재학습(negatives 오탐 226개 제거, B-3c) 완료 — **결과 동일**.
 >
 > **갱신 (2026-04-15)**: **Phase 2.5 비활성화**(`--llm-select` 미사용) — 제출·평가는 **Reranker 출력** 기준. 검색 튜닝: `--multi-field`(멀티필드 boost ^2/^1.5/^1.2/^1.2), BM25:Dense **7:3**, 다축 RRF **`--rrf-weights 0.4,0.3,0.3`**, **`--top-k-retrieve 30`**, **`--top-k-rerank 15`** — 리더보드 **MAP=0.925 / MRR=0.9242** (실험 **G-3**).
 >
-> **갱신 (2026-04-14)**: G-1(`--llm-select`) 리더보드 제출 **MAP=MRR=0.8795** — 목표 0.85+ 달성. B-3b(Reranker QLoRA) 단독 제출 **MAP=MRR=0.2439** (기대 대비 저조; 추론·데이터 점검 대상).
+> **갱신 (2026-04-14)**: G-1(`--llm-select`) 리더보드 제출 **MAP=MRR=0.8795** — 목표 0.85+ 달성. B-3b(Reranker QLoRA) 단독 제출 **MAP=MRR=0.2439** (기대 대비 저조; 추론·데이터 점검 대상)일
 >
 > **갱신 (2026-04-14)**: Phase 0 캐시 `artifacts/phase0_queries_llm_select_total_solar.csv` + Phase 1 다축 RRF 가중치 **`--rrf-weights 0.5,0.25,0.25`** (standalone / HyDE / alt) 적용 제출 — 리더보드 **MAP=0.8386 / MRR=0.8424**. (G-1 대비 설정·캐시가 다르면 수치 직접 비교는 참고용.)
 >
@@ -23,7 +26,7 @@
 | ------------------------ | ---------------------------------------------- | ------------------------------------------------------ |
 | **문서 메타 정보**       | LLM으로 제목·키워드·요약·카테고리 생성 후 색인 | 원본 content 필드만 색인                               |
 | **ES 유사도 알고리즘**   | LMJelinekMercer                                | 기본 BM25 (TF-IDF 계열)                                |
-| **ES 동의어 사전**       | 사용자 정의 동의어 적용                        | 없음                                                   |
+| **ES 동의어 사전**       | 사용자 정의 동의어 적용                        | `science_synonyms.txt` 적용; G-5(2026-04-22) 기준 **한-영만·한-한 대폭 삭제** |
 | **Reranker Fine-tuning** | 도메인 파인튜닝 완료                           | QLoRA 시도(B-3b) — 리더보드 단독 **0.2439** (저조)     |
 | **LLM 최종 선별**        | Reranker 이후 LLM 프롬프트로 최적 문서 재선택  | G-1(`--llm-select`) 적용 — 리더보드 **MAP=MRR=0.8795** |
 
@@ -32,7 +35,7 @@
 
 ---
 
-## 진행 현황 (2026-04-15 갱신)
+## 진행 현황 (2026-04-22 갱신)
 
 | Phase  | 항목                                                                     | 상태    | 결과                                                                                       |
 | ------ | ------------------------------------------------------------------------ | ------- | ------------------------------------------------------------------------------------------ |
@@ -55,8 +58,11 @@
 | H-1    | Phase 0 쿼리 품질 분석 (inspection.csv 57건)                             | ✅ 완료 | HyDE 문체 불일치·standalone 구어체·alt_query 단순 재표현 확인 → 개선 방향 수립 (부록 참조) |
 | F-2c   | ES 재인덱싱: 사용자 사전 + 동의어 보완                                   | ✅ 완료 | 주요 검색 오류 해결 목적으로 사용자 사전·동의어 일부 추가 후 재인덱싱                      |
 | F-3    | Embedding Instruction 도메인 강화 + Qdrant 재인덱싱                      | ✅ 완료 | 과학 도메인 특화 프롬프트로 강화 후 4,272건 재인덱싱                                       |
-| G-4    | Multi-field boost 튜닝 (Title^2, Keywords^1.5, Summary^1.2, Content^3.5) | ✅ 완료 | 리더보드 **MAP=0.9250 / MRR=0.9273** — 현재 최고 성능                                      |
-| B-3c   | Reranker SFT 재학습 (negatives 오탐 226개 제거)                          | ✅ 완료 | `reranker_triplets.json` 오탐 정제 후 재학습 — **결과 미확인**                             |
+| G-4    | Multi-field boost 튜닝 (Title^2, Keywords^1.5, Summary^1.2, Content^3.5) | ✅ 완료 | 리더보드 **MAP=0.9250 / MRR=0.9273** — G-5 이전 최고                                    |
+| G-5    | ES 동의어 사전 축소(한-한 삭제·한-영만) + 재색인 + 제출(Phase 2.5 끔)   | ✅ 완료 | 리더보드 **MAP=0.9311 / MRR=0.9333** — Reranker 출력 기준; **최종 최고**                  |
+| B-3c   | Reranker SFT 재학습 (negatives 오탐 226개 제거)                          | ✅ 완료 | 재학습 완료 — 성능 개선 없음 (G-5 대비 동일 수준)                                          |
+| H-2    | Phase 0 쿼리 품질 개선 실험 (HyDE 문체 + 단일턴 standalone 재작성)       | ✅ 완료 | ① HyDE+standalone 동시 → **MAP=0.8356** (하락) ② HyDE 단독 → **MAP=0.9250** (하락) → 롤백 |
+| I-1    | `build_doc_metadata.py` 프롬프트 개선 → `doc_metadata_v2.jsonl` + ES 재인덱싱 | ✅ 완료 | 카테고리 버그 수정·src 힌트·영어 병기·hallucination 방지 — **MAP=0.9311 / MRR=0.9333** (변화 없음) |
 
 ### 주요 이슈 해결 기록
 
@@ -79,7 +85,11 @@
 | G-2  | `phase0_queries_llm_select_total_solar.csv` + `--rrf-weights 0.5,0.25,0.25`                                                                     | **0.8386** | **0.8424** | Solar Phase0 캐시; 다축 RRF에서 standalone 가중                                                   |
 | RRF  | `--rrf-weights 0.6,0.15,0.25`                                                                                                                   | **0.5652** | **0.5652** | standalone 0.6·HyDE 0.15·alt 0.25; G-2 대비 하락 → 균형 잡힌 가중(예: 0.4/0.3/0.3) 추가 실험 후보 |
 | G-3  | `--multi-field` · BM25:Dense 7:3 · `--rrf-weights 0.4,0.3,0.3` · `--top-k-retrieve 30` · `--top-k-rerank 15` · **Phase 2.5 미사용**             | **0.925**  | **0.9242** | `--llm-select` 없음; **제출·평가 top-k는 Reranker 출력** 기준                                     |
-| G-4  | G-3 + ES 사용자사전·동의어 보완(F-2c) + Embedding Instruction 강화·재인덱싱(F-3) + boost 튜닝 `Title^2, Keywords^1.5, Summary^1.2, Content^3.5` | **0.9250** | **0.9273** | **현재 최고 성능**                                                                                |
+| G-4  | G-3 + ES 사용자사전·동의어 보완(F-2c) + Embedding Instruction 강화·재인덱싱(F-3) + boost 튜닝 `Title^2, Keywords^1.5, Summary^1.2, Content^3.5` | **0.9250** | **0.9273** | G-5 이전 최고                                                                                     |
+| G-5  | G-4 색인·파이프라인 동일, ES 동의어 사전 한-한 항목 대폭 삭제·한-영만 유지 후 **재색인** · **Phase 2.5 미사용**                                 | **0.9311** | **0.9333** | **최종 최고**                                                                                     |
+| H-2a | G-5 인덱스 기반, HyDE 프롬프트 교과서 문체 변경 + 단일턴 standalone 재작성 추가                                                                | **0.8356** | —          | Phase 0 쿼리 품질 개선 실험 — 대폭 하락 (단일턴 재작성 180건 과도 변형)                          |
+| H-2b | G-5 인덱스 기반, HyDE 프롬프트 교과서 문체 변경만 (standalone 재작성 롤백)                                                                     | **0.9250** | —          | HyDE 단독 변경 — 하락. 두 변경 모두 롤백, G-5 유지                                               |
+| I-1  | `doc_metadata_v2.jsonl` (카테고리 버그 수정·src 힌트·영어 병기·hallucination 방지) + ES 재인덱싱                                               | **0.9311** | **0.9333** | 변화 없음 — 성능 한계 확인, 프로젝트 완료                                                        |
 
 ### Dense 오염 패턴 분석
 
@@ -390,7 +400,22 @@ python scripts/run_competition_map.py \
 | `summary`  | ^1.2       | **^1.2** (유지) |
 | `content`  | ^1.2       | **^3.5** (상향) |
 
-**결과**: 리더보드 **MAP=0.9250 / MRR=0.9273** — 현재 최고 성능
+**결과**: 리더보드 **MAP=0.9250 / MRR=0.9273** — G-5 이전 최고
+
+---
+
+## Phase G-5 — ES 동의어 사전 축소(한-영만) + 재색인 ✅ 완료
+
+**목적**: 한글↔한글 동의어 확장이 일부 쿼리에서 정밀도를 떨어뜨리는 효과를 줄이기 위해, 동의어 규칙을 **한글↔영어** 쌍 위주로 정리.
+
+**적용**
+
+- `artifacts/science_synonyms.txt`에서 **한-한(한글↔한글) 항목 대폭 삭제**, **한-영(한글↔영어) 항목만** 유지
+- `index_es.py`로 ES 인덱스 **재생성·재색인** (`--recreate` 등 기존 F-2 흐름과 동일)
+
+**제출**: G-4와 동일 `export_submission.py` 파이프라인, **`--llm-select` 미사용**(Reranker 출력 기준).
+
+**결과**: 리더보드 **MAP=0.9311 / MRR=0.9333** — **최종 최고 성능**(참조 팀 0.9288 대비 상회).
 
 ---
 
@@ -437,11 +462,14 @@ python scripts/run_competition_map.py \
 | 13   | G-3    | `export_submission.py` 검색·리랭크 튜닝, `--llm-select` 없음 | ✅ 완료   | 리더보드 MAP=0.925 / MRR=0.9242 — Phase 2.5 비활성, Reranker 출력 기준         |
 | 14   | F-2c   | `index_es.py --recreate` (사용자사전·동의어 보완)            | ✅ 완료   | 주요 검색 오류 해결 목적                                                       |
 | 15   | F-3    | `index_qdrant.py` (Embedding Instruction 강화 후 재인덱싱)   | ✅ 완료   | 과학 도메인 특화 프롬프트 적용                                                 |
-| 16   | G-4    | `export_submission.py` boost 튜닝 (Content^3.5)              | ✅ 완료   | 리더보드 **MAP=0.9250 / MRR=0.9273** — 현재 최고 성능                          |
-| 17   | B-3c   | `train_reranker.py` (negatives 오탐 226개 제거 후)           | ✅ 완료   | 결과 미확인 — 리더보드 제출 필요                                               |
-| 18   | D      | `serve_app.py` + `static/index.html`                         | ⬜ 미시작 | 서빙 UI — 전체 검증 완료 후                                                    |
+| 16   | G-4    | `export_submission.py` boost 튜닝 (Content^3.5)              | ✅ 완료   | 리더보드 **MAP=0.9250 / MRR=0.9273** — G-5 이전 최고                        |
+| 17   | G-5    | 동의어 사전 한-영만·한-한 축소 → `index_es.py` 재색인 → 제출( `--llm-select` 없음) | ✅ 완료   | 리더보드 **MAP=0.9311** — **현재 최고**                                        |
+| 18   | B-3c   | `train_reranker.py` (negatives 오탐 226개 제거 후)           | ✅ 완료   | 성능 개선 없음 (G-5 대비 동일)                                                 |
+| 19   | H-2    | Phase 0 쿼리 개선 실험 (HyDE 문체 + 단일턴 재작성)           | ✅ 완료   | 두 변경 모두 하락 → 롤백. G-5 유지                                             |
+| 20   | I-1    | `build_doc_metadata.py` 프롬프트 개선 + `doc_metadata_v2.jsonl` 재생성 + ES 재인덱싱 | ✅ 완료   | **MAP=0.9311 / MRR=0.9333** — 변화 없음                          |
+| 21   | D      | `serve_app.py` + `static/index.html`                         | ⬜ 미시작 | 서빙 UI — 미진행                                                               |
 
-> **현재 우선순위**: **G-4**가 MAP=0.9250 / MRR=0.9273으로 현재 최고 성능. **B-3c**(Reranker 재학습) 리더보드 제출로 효과 확인 필요. G-3(0.925/0.9242) · G-1(`--llm-select`, 0.8795) · B-3b 단독(0.2439 저조) 순.
+> **최종 결론 (2026-04-22)**: **G-5(MAP=0.9311 / MRR=0.9333)** 가 최종 최고 성능. 이후 모든 추가 실험(B-3c·H-2·I-1·llm-select 재실험·top-k·가중치 재탐색)에서 G-5 대비 개선 없음. **프로젝트 완료.**
 
 ---
 

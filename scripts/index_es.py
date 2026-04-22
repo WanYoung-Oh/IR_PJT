@@ -103,7 +103,10 @@ def main() -> None:
             if use_meta and did in meta_map:
                 m = meta_map[did]
                 source["title"] = m.get("title", "")
-                source["keywords"] = " ".join(m.get("keywords", []))  # text 필드에 공백 구분 저장
+                # keywords가 중첩 리스트인 경우 flatten 후 공백 구분 저장
+                kws = m.get("keywords", [])
+                flat_kws = [str(x) for k in kws for x in (k if isinstance(k, list) else [k])]
+                source["keywords"] = " ".join(flat_kws)
                 source["summary"] = m.get("summary", "")
                 source["category"] = m.get("category", "")
             yield {

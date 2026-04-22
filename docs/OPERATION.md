@@ -696,7 +696,7 @@ python scripts/validate_submission.py artifacts/sample_submission_clean.csv
 pip install ragas datasets "langchain-google-genai>=4.0.0"
 
 python scripts/ragas_eval.py \
-  --submission artifacts/sample_submission.csv \
+  --submission artifacts/sample_submission_7_best.csv \
   --eval data/eval.jsonl \
   --documents data/documents.jsonl
 ```
@@ -754,14 +754,16 @@ python -m pytest tests/ --cov=ir_rag --cov-report=term-missing
 | `llm`           | `model_name`, `checkpoint`, `max_new_tokens`   |
 | (CLI)           | Phase 0·3 API 모드: `export_submission.py --phase0-api solar --phase3-api solar` — `.env`에 `SOLAR_API_KEY` |
 
-**B-3c Reranker 파인튜닝 모델 전환** (negatives 오탐 226개 제거 후 재학습 — 결과 미확인):
+**B-3c Reranker 파인튜닝 모델 전환** (negatives 오탐 226개 제거 후 재학습 — 성능 개선 없음, 기본 모델 유지):
 
 ```yaml
-# config/default.yaml
+# config/default.yaml — 기본값 유지 권장
 reranker:
-  model_name: "artifacts/qwen3-reranker-8b-science"
+  model_name: "Qwen/Qwen3-Reranker-8B"
   trust_remote_code: true
 ```
+
+> **최종 제출 파일**: `artifacts/sample_submission_90_best_synonyms_down.csv` — **MAP=0.9311 / MRR=0.9333** (G-5, 2026-04-22)
 
 ---
 
