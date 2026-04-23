@@ -1,8 +1,10 @@
 # RAG 파이프라인 개선 계획
 
-> **최종 결과**: 베이스라인 0.6682 → **MAP=0.9356** (G-6, 2026-04-23) — BM25:Dense 6:4 비율 조정으로 G-5(0.9311) 대비 추가 개선.
+> **최종 결과**: 베이스라인 0.6682 → **MAP=0.9447 / MRR=0.9470** (G-6 Listwise OFF, 2026-04-23) — 실험 완료.
 >
-> **갱신 (2026-04-23)**: BM25:Dense 비율 **6:4** 실험(G-6) — G-5(7:3) 대비 Dense 비중 상향 → **MAP=0.9356** (최고 성적 갱신).
+> **갱신 (2026-04-23)**: Phase 2.5 **Listwise 재정렬** 실험(J-1) 완료. n=3, BM25:Dense 6:4 조건에서 listwise ON → **MAP=0.9417 / MRR=0.9485**, listwise OFF → **MAP=0.9447 / MRR=0.9470**. **Listwise를 끈 G-6 설정이 최고 성능**으로 확인.
+>
+> **갱신 (2026-04-23, 이전)**: BM25:Dense 비율 **6:4** 실험(G-6) — G-5(7:3) 대비 Dense 비중 상향 → **MAP=0.9356** (최고 성적 갱신).
 >
 > **갱신 (2026-04-22, 이전 최고)**: 문서 메타데이터 프롬프트 개선(I-1) — `build_doc_metadata.py` 카테고리 버그 수정·src 도메인 힌트·keywords 영어 병기·summary hallucination 방지 적용 후 `doc_metadata_v2.jsonl` 재생성 → ES 재인덱싱 → **MAP=0.9311 / MRR=0.9333** (변화 없음). Phase 0 쿼리 품질 개선 실험(H-2) — ① HyDE 프롬프트 교과서 문체 변경 + 단일턴 standalone 재작성 동시 적용 → **MAP=0.8356** (하락). ② HyDE 프롬프트 단독 변경 → **MAP=0.9250** (하락). 두 변경 모두 롤백. `--llm-select` G-5 인덱스 재실험 → **MAP=0.8 대** (하락). top-k·Reranker 가중치·BM25:Dense 비율 재탐색 모두 G-5 대비 개선 없음. **G-5(MAP=0.9311 / MRR=0.9333)를 최종 제출로 확정.**
 >
@@ -24,48 +26,49 @@
 
 동일 대회 1위 팀 솔루션 분석 결과 아래 격차가 확인됨:
 
-| 구성 요소                | 참조 팀 (MAP 0.9288)                           | 우리 현황                                              |
-| ------------------------ | ---------------------------------------------- | ------------------------------------------------------ |
-| **문서 메타 정보**       | LLM으로 제목·키워드·요약·카테고리 생성 후 색인 | 원본 content 필드만 색인                               |
-| **ES 유사도 알고리즘**   | LMJelinekMercer                                | 기본 BM25 (TF-IDF 계열)                                |
+| 구성 요소                | 참조 팀 (MAP 0.9288)                           | 우리 현황                                                                     |
+| ------------------------ | ---------------------------------------------- | ----------------------------------------------------------------------------- |
+| **문서 메타 정보**       | LLM으로 제목·키워드·요약·카테고리 생성 후 색인 | 원본 content 필드만 색인                                                      |
+| **ES 유사도 알고리즘**   | LMJelinekMercer                                | 기본 BM25 (TF-IDF 계열)                                                       |
 | **ES 동의어 사전**       | 사용자 정의 동의어 적용                        | `science_synonyms.txt` 적용; G-5(2026-04-22) 기준 **한-영만·한-한 대폭 삭제** |
-| **Reranker Fine-tuning** | 도메인 파인튜닝 완료                           | QLoRA 시도(B-3b) — 리더보드 단독 **0.2439** (저조)     |
-| **LLM 최종 선별**        | Reranker 이후 LLM 프롬프트로 최적 문서 재선택  | G-1(`--llm-select`) 적용 — 리더보드 **MAP=MRR=0.8795** |
+| **Reranker Fine-tuning** | 도메인 파인튜닝 완료                           | QLoRA 시도(B-3b) — 리더보드 단독 **0.2439** (저조)                            |
+| **LLM 최종 선별**        | Reranker 이후 LLM 프롬프트로 최적 문서 재선택  | G-1(`--llm-select`) 적용 — 리더보드 **MAP=MRR=0.8795**                        |
 
 > **청킹 미적용 결정**: 우리 문서의 content 평균 315자 / 최대 1,230자로 이미 패시지 크기.
 > 청킹 시 문맥 절단으로 Reranker 정확도 저하 위험이 높아 제외.
 
 ---
 
-## 진행 현황 (2026-04-22 갱신)
+## 진행 현황 (2026-04-23 갱신)
 
-| Phase  | 항목                                                                     | 상태    | 결과                                                                                       |
-| ------ | ------------------------------------------------------------------------ | ------- | ------------------------------------------------------------------------------------------ |
-| 인프라 | Qdrant 인덱싱                                                            | ✅ 완료 | 4,272건 인덱싱 (UUID5 직접 upsert 방식으로 LlamaIndex 버그 우회)                           |
-| B-1    | Hybrid+Reranker+Faithfulness 데이터 재구축                               | ✅ 완료 | 포함 158건 / 제외 62건 (통과율 72%) — **오염 확인, 미사용 결정**                           |
-| A-1    | documents.jsonl 기반 QA 생성 (2000건)                                    | ✅ 완료 | 포함 1,747건 / 통과율 87.4% → `artifacts/sft_doc_qa.jsonl` (8.9MB)                         |
-| B-2    | A-1 + B-1 데이터 혼합                                                    | ✅ 완료 | 1,905건 → `artifacts/sft_data_final.jsonl` (9.2MB)                                         |
-| C-1    | SFT 학습 (Qwen3.5-4B QLoRA 4-bit)                                        | ✅ 완료 | `artifacts/qwen35-4b-science-rag` — **오염 데이터 영향으로 폐기**                          |
-| C-2    | 리더보드 제출 #2 (4B SFT)                                                | ✅ 완료 | **MAP=0.3364** (Dense 노이즈 + `<think>` 오염)                                             |
-| D-1~3  | MAP 하락 원인 분석 + BM25 단독 실험                                      | ✅ 완료 | 제출 #3 MAP=0.4364 — HyDE 미사용이 핵심 원인                                               |
-| E-1    | Weighted RRF + HyDE 복원 + 9B LLM 전환                                   | ✅ 완료 | **MAP=0.3864** — Dense 7:3에서도 오염 지속, 베이스라인 미달                                |
-| F-1    | 문서 메타 정보 생성                                                      | ✅ 완료 | 4,272건 생성 → `artifacts/doc_metadata.jsonl` (2.1MB)                                      |
-| F-2a   | 과학 동의어 사전 생성                                                    | ✅ 완료 | 233개 규칙 → `artifacts/science_synonyms.txt`                                              |
-| F-2b   | ES 재인덱싱 (LMJelinekMercer + 동의어 + 메타)                            | ✅ 완료 | 사용자사전 750개 + 동의어 233개 + 멀티필드 + LMJelinekMercer 적용                          |
-| G-1    | LLM 최종 문서 선별 (Phase 2.5)                                           | ✅ 완료 | 리더보드 **MAP=MRR=0.8795** (`export_submission.py --llm-select`)                          |
-| G-2    | Solar Phase0 캐시 + 다축 RRF 가중 (0.5/0.25/0.25)                        | ✅ 완료 | 리더보드 **MAP=0.8386 / MRR=0.8424** (`--phase0-cache` + `--rrf-weights`)                  |
-| G-3    | 검색·리랭크 파라미터 튜닝 (Phase 2.5 끔)                                 | ✅ 완료 | 리더보드 **MAP=0.925 / MRR=0.9242** — Reranker 출력으로 제출·평가 (`--llm-select` 없음)    |
-| B-3a   | Reranker 트리플렛 생성                                                   | ✅ 완료 | 1,747건 → `artifacts/reranker_triplets.jsonl`                                              |
-| B-3b   | Reranker Fine-tuning                                                     | ✅ 완료 | QLoRA 1968 steps / 3 epoch                                                                 |
-| H-1    | Phase 0 쿼리 품질 분석 (inspection.csv 57건)                             | ✅ 완료 | HyDE 문체 불일치·standalone 구어체·alt_query 단순 재표현 확인 → 개선 방향 수립 (부록 참조) |
-| F-2c   | ES 재인덱싱: 사용자 사전 + 동의어 보완                                   | ✅ 완료 | 주요 검색 오류 해결 목적으로 사용자 사전·동의어 일부 추가 후 재인덱싱                      |
-| F-3    | Embedding Instruction 도메인 강화 + Qdrant 재인덱싱                      | ✅ 완료 | 과학 도메인 특화 프롬프트로 강화 후 4,272건 재인덱싱                                       |
-| G-4    | Multi-field boost 튜닝 (Title^2, Keywords^1.5, Summary^1.2, Content^3.5) | ✅ 완료 | 리더보드 **MAP=0.9250 / MRR=0.9273** — G-5 이전 최고                                    |
-| G-5    | ES 동의어 사전 축소(한-한 삭제·한-영만) + 재색인 + 제출(Phase 2.5 끔)   | ✅ 완료 | 리더보드 **MAP=0.9311 / MRR=0.9333** — Reranker 출력 기준; **최종 최고**                  |
-| B-3c   | Reranker SFT 재학습 (negatives 오탐 226개 제거)                          | ✅ 완료 | 재학습 완료 — 성능 개선 없음 (G-5 대비 동일 수준)                                          |
-| H-2    | Phase 0 쿼리 품질 개선 실험 (HyDE 문체 + 단일턴 standalone 재작성)       | ✅ 완료 | ① HyDE+standalone 동시 → **MAP=0.8356** (하락) ② HyDE 단독 → **MAP=0.9250** (하락) → 롤백 |
-| I-1    | `build_doc_metadata.py` 프롬프트 개선 → `doc_metadata_v2.jsonl` + ES 재인덱싱 | ✅ 완료 | 카테고리 버그 수정·src 힌트·영어 병기·hallucination 방지 — **MAP=0.9311 / MRR=0.9333** (변화 없음) |
-| G-6    | BM25:Dense 비율 **6:4** 조정 (G-5 인덱스 재사용, Phase 2.5 끔)               | ✅ 완료 | **MAP=0.9356** — **최고 성적 갱신**                                                                  |
+| Phase  | 항목                                                                          | 상태       | 결과                                                                                               |
+| ------ | ----------------------------------------------------------------------------- | ---------- | -------------------------------------------------------------------------------------------------- |
+| 인프라 | Qdrant 인덱싱                                                                 | ✅ 완료    | 4,272건 인덱싱 (UUID5 직접 upsert 방식으로 LlamaIndex 버그 우회)                                   |
+| B-1    | Hybrid+Reranker+Faithfulness 데이터 재구축                                    | ✅ 완료    | 포함 158건 / 제외 62건 (통과율 72%) — **오염 확인, 미사용 결정**                                   |
+| A-1    | documents.jsonl 기반 QA 생성 (2000건)                                         | ✅ 완료    | 포함 1,747건 / 통과율 87.4% → `artifacts/sft_doc_qa.jsonl` (8.9MB)                                 |
+| B-2    | A-1 + B-1 데이터 혼합                                                         | ✅ 완료    | 1,905건 → `artifacts/sft_data_final.jsonl` (9.2MB)                                                 |
+| C-1    | SFT 학습 (Qwen3.5-4B QLoRA 4-bit)                                             | ✅ 완료    | `artifacts/qwen35-4b-science-rag` — **오염 데이터 영향으로 폐기**                                  |
+| C-2    | 리더보드 제출 #2 (4B SFT)                                                     | ✅ 완료    | **MAP=0.3364** (Dense 노이즈 + `<think>` 오염)                                                     |
+| D-1~3  | MAP 하락 원인 분석 + BM25 단독 실험                                           | ✅ 완료    | 제출 #3 MAP=0.4364 — HyDE 미사용이 핵심 원인                                                       |
+| E-1    | Weighted RRF + HyDE 복원 + 9B LLM 전환                                        | ✅ 완료    | **MAP=0.3864** — Dense 7:3에서도 오염 지속, 베이스라인 미달                                        |
+| F-1    | 문서 메타 정보 생성                                                           | ✅ 완료    | 4,272건 생성 → `artifacts/doc_metadata.jsonl` (2.1MB)                                              |
+| F-2a   | 과학 동의어 사전 생성                                                         | ✅ 완료    | 233개 규칙 → `artifacts/science_synonyms.txt`                                                      |
+| F-2b   | ES 재인덱싱 (LMJelinekMercer + 동의어 + 메타)                                 | ✅ 완료    | 사용자사전 750개 + 동의어 233개 + 멀티필드 + LMJelinekMercer 적용                                  |
+| G-1    | LLM 최종 문서 선별 (Phase 2.5)                                                | ✅ 완료    | 리더보드 **MAP=MRR=0.8795** (`export_submission.py --llm-select`)                                  |
+| G-2    | Solar Phase0 캐시 + 다축 RRF 가중 (0.5/0.25/0.25)                             | ✅ 완료    | 리더보드 **MAP=0.8386 / MRR=0.8424** (`--phase0-cache` + `--rrf-weights`)                          |
+| G-3    | 검색·리랭크 파라미터 튜닝 (Phase 2.5 끔)                                      | ✅ 완료    | 리더보드 **MAP=0.925 / MRR=0.9242** — Reranker 출력으로 제출·평가 (`--llm-select` 없음)            |
+| B-3a   | Reranker 트리플렛 생성                                                        | ✅ 완료    | 1,747건 → `artifacts/reranker_triplets.jsonl`                                                      |
+| B-3b   | Reranker Fine-tuning                                                          | ✅ 완료    | QLoRA 1968 steps / 3 epoch                                                                         |
+| H-1    | Phase 0 쿼리 품질 분석 (inspection.csv 57건)                                  | ✅ 완료    | HyDE 문체 불일치·standalone 구어체·alt_query 단순 재표현 확인 → 개선 방향 수립 (부록 참조)         |
+| F-2c   | ES 재인덱싱: 사용자 사전 + 동의어 보완                                        | ✅ 완료    | 주요 검색 오류 해결 목적으로 사용자 사전·동의어 일부 추가 후 재인덱싱                              |
+| F-3    | Embedding Instruction 도메인 강화 + Qdrant 재인덱싱                           | ✅ 완료    | 과학 도메인 특화 프롬프트로 강화 후 4,272건 재인덱싱                                               |
+| G-4    | Multi-field boost 튜닝 (Title^2, Keywords^1.5, Summary^1.2, Content^3.5)      | ✅ 완료    | 리더보드 **MAP=0.9250 / MRR=0.9273** — G-5 이전 최고                                               |
+| G-5    | ES 동의어 사전 축소(한-한 삭제·한-영만) + 재색인 + 제출(Phase 2.5 끔)         | ✅ 완료    | 리더보드 **MAP=0.9311 / MRR=0.9333** — Reranker 출력 기준; **최종 최고**                           |
+| B-3c   | Reranker SFT 재학습 (negatives 오탐 226개 제거)                               | ✅ 완료    | 재학습 완료 — 성능 개선 없음 (G-5 대비 동일 수준)                                                  |
+| H-2    | Phase 0 쿼리 품질 개선 실험 (HyDE 문체 + 단일턴 standalone 재작성)            | ✅ 완료    | ① HyDE+standalone 동시 → **MAP=0.8356** (하락) ② HyDE 단독 → **MAP=0.9250** (하락) → 롤백          |
+| I-1    | `build_doc_metadata.py` 프롬프트 개선 → `doc_metadata_v2.jsonl` + ES 재인덱싱 | ✅ 완료    | 카테고리 버그 수정·src 힌트·영어 병기·hallucination 방지 — **MAP=0.9311 / MRR=0.9333** (변화 없음) |
+| G-6    | BM25:Dense 비율 **6:4** 조정 (G-5 인덱스 재사용, Phase 2.5 끔)                | ✅ 완료    | **MAP=0.9356** — **최고 성적 갱신**                                                                |
+| J-1    | Phase 2.5 **Listwise 재정렬** 실험 (`--listwise`, Solar API, n=3, Phase 2 캐시) | ✅ 완료    | listwise ON: **MAP=0.9417 / MRR=0.9485** / listwise OFF: **MAP=0.9447 / MRR=0.9470** → **OFF가 최고** |
 
 ### 주요 이슈 해결 기록
 
@@ -90,10 +93,12 @@
 | G-3  | `--multi-field` · BM25:Dense 7:3 · `--rrf-weights 0.4,0.3,0.3` · `--top-k-retrieve 30` · `--top-k-rerank 15` · **Phase 2.5 미사용**             | **0.925**  | **0.9242** | `--llm-select` 없음; **제출·평가 top-k는 Reranker 출력** 기준                                     |
 | G-4  | G-3 + ES 사용자사전·동의어 보완(F-2c) + Embedding Instruction 강화·재인덱싱(F-3) + boost 튜닝 `Title^2, Keywords^1.5, Summary^1.2, Content^3.5` | **0.9250** | **0.9273** | G-5 이전 최고                                                                                     |
 | G-5  | G-4 색인·파이프라인 동일, ES 동의어 사전 한-한 항목 대폭 삭제·한-영만 유지 후 **재색인** · **Phase 2.5 미사용**                                 | **0.9311** | **0.9333** | **최종 최고**                                                                                     |
-| H-2a | G-5 인덱스 기반, HyDE 프롬프트 교과서 문체 변경 + 단일턴 standalone 재작성 추가                                                                | **0.8356** | —          | Phase 0 쿼리 품질 개선 실험 — 대폭 하락 (단일턴 재작성 180건 과도 변형)                          |
-| H-2b | G-5 인덱스 기반, HyDE 프롬프트 교과서 문체 변경만 (standalone 재작성 롤백)                                                                     | **0.9250** | —          | HyDE 단독 변경 — 하락. 두 변경 모두 롤백, G-5 유지                                               |
-| I-1  | `doc_metadata_v2.jsonl` (카테고리 버그 수정·src 힌트·영어 병기·hallucination 방지) + ES 재인덱싱                                               | **0.9311** | **0.9333** | 변화 없음                                                                                         |
-| G-6  | G-5 인덱스 기반, BM25:Dense **6:4** (Dense 비중 상향) · Phase 2.5 미사용                                                                      | **0.9356** | —          | **최고 성적 갱신**                                                                                |
+| H-2a | G-5 인덱스 기반, HyDE 프롬프트 교과서 문체 변경 + 단일턴 standalone 재작성 추가                                                                 | **0.8356** | —          | Phase 0 쿼리 품질 개선 실험 — 대폭 하락 (단일턴 재작성 180건 과도 변형)                           |
+| H-2b | G-5 인덱스 기반, HyDE 프롬프트 교과서 문체 변경만 (standalone 재작성 롤백)                                                                      | **0.9250** | —          | HyDE 단독 변경 — 하락. 두 변경 모두 롤백, G-5 유지                                                |
+| I-1  | `doc_metadata_v2.jsonl` (카테고리 버그 수정·src 힌트·영어 병기·hallucination 방지) + ES 재인덱싱                                                | **0.9311** | **0.9333** | 변화 없음                                                                                         |
+| G-6  | G-5 인덱스 기반, BM25:Dense **6:4** (Dense 비중 상향) · Phase 2.5 미사용                                                                        | **0.9356** | —          | 리더보드 제출 — 최고 성적 갱신                                                                    |
+| J-1a | G-6 기반, Phase 2.5 **Listwise ON** (`--listwise --listwise-n 3`, Solar API)                                                                    | **0.9417** | **0.9485** | 로컬 평가 — MRR은 높으나 MAP은 OFF 대비 낮음                                                      |
+| J-1b | G-6 기반, Phase 2.5 **Listwise OFF** (Reranker 출력 기준) · BM25:Dense 6:4                                                                     | **0.9447** | **0.9470** | 로컬 평가 — **현재 최고 MAP**. Listwise 없는 G-6 파이프라인이 최적 확인                           |
 
 ### Dense 오염 패턴 분석
 
@@ -406,12 +411,12 @@ python scripts/run_competition_map.py \
 
 **keywords boost 추가 실험** (로컬 MAP 기준, Phase 0 캐시 재사용):
 
-| `keywords` boost | 로컬 MAP | 비고 |
-| ---------------- | -------- | ---- |
+| `keywords` boost | 로컬 MAP                 | 비고                   |
+| ---------------- | ------------------------ | ---------------------- |
 | ^1.5             | **0.925** (G-3/G-4 기준) | **최상** — 현재 적용값 |
-| ^2               | 0.925    | ^1.5와 동일 수준 |
-| ^2.5             | 0.922    | 소폭 하락 |
-| ^3               | 0.9242   | 하락 |
+| ^2               | 0.925                    | ^1.5와 동일 수준       |
+| ^2.5             | 0.922                    | 소폭 하락              |
+| ^3               | 0.9242                   | 하락                   |
 
 > **결론**: `Keywords^1.5`가 최적. 부스트 상향 시 오히려 precision 저하. G-4 설정 유지 확정.
 
@@ -440,12 +445,12 @@ python scripts/run_competition_map.py \
 
 **변경 내용**
 
-| 항목           | G-5 (이전) | G-6 (변경)  |
-| -------------- | ---------- | ----------- |
-| BM25 가중치    | 0.7        | **0.6**     |
-| Dense 가중치   | 0.3        | **0.4**     |
-| 인덱스·파이프라인 | G-5 동일  | G-5 동일    |
-| Phase 2.5      | 미사용     | 미사용      |
+| 항목              | G-5 (이전) | G-6 (변경) |
+| ----------------- | ---------- | ---------- |
+| BM25 가중치       | 0.7        | **0.6**    |
+| Dense 가중치      | 0.3        | **0.4**    |
+| 인덱스·파이프라인 | G-5 동일   | G-5 동일   |
+| Phase 2.5         | 미사용     | 미사용     |
 
 **실행 명령**
 
@@ -459,6 +464,73 @@ python scripts/export_submission.py \
 ```
 
 **결과**: **MAP=0.9356** — **최고 성적 갱신** (G-5 대비 +0.0045)
+
+---
+
+## Phase J-1 — Listwise 재정렬 (Phase 2.5 개편) 🔄 실험 중
+
+**목적**: 기존 `--llm-select`(pointwise: top-5에서 3개 선택)를 **listwise 재정렬**(top-N 전체를 LLM이 순서 재배치)로 대체하여 Phase 2.5 품질 향상. 참조 코드(`listwise_utils_0.9386.py`) 기반으로 MAP=0.9386 달성 사례 확인.
+
+**구현 내용**
+
+| 파일                              | 변경                                                                                                                          |
+| --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `src/ir_rag/listwise_reranker.py` | 신규 — `listwise_rerank()` 함수, few-shot 2개 내장, fallback 포함                                                             |
+| `scripts/export_submission.py`    | `--llm-select` → `--listwise` 대체; Phase 2 결과 `artifacts/phase2_rerank.jsonl` 자동 저장; `--phase2-cache` 패스트 경로 추가 |
+
+**Phase 2.5 방식 비교**
+
+| 항목            | 기존 `--llm-select`            | 신규 `--listwise`                                            |
+| --------------- | ------------------------------ | ------------------------------------------------------------ |
+| LLM 역할        | top-5에서 3개 선택 (pointwise) | top-N 전체 순서 재배치 (listwise)                            |
+| 상대 순위 활용  | ❌                             | ✅                                                           |
+| 파라미터 튜닝   | 불가 (캐시 없음)               | `--listwise-n` / `--no-preserve-top1` / `--listwise-fewshot` |
+| Reranker 재실행 | 매번 필요                      | `--phase2-cache`로 생략 가능                                 |
+
+**튜닝 파라미터**
+
+| 파라미터             | 기본값          | 설명                               |
+| -------------------- | --------------- | ---------------------------------- |
+| `--listwise-n`       | 10              | LLM에 넘기는 Reranker 상위 후보 수 |
+| `--no-preserve-top1` | False (고정 ON) | Reranker top-1 고정 비활성화       |
+| `--listwise-fewshot` | False           | few-shot 예시 2개 포함 여부        |
+
+**실행 명령**
+
+```bash
+# 1회차: 전체 실행 (Phase 2 결과가 artifacts/phase2_rerank.jsonl에 자동 저장)
+python scripts/export_submission.py \
+  --pipeline --config config/default.yaml \
+  --bm25-weight 0.6 --dense-weight 0.4 --multi-field \
+  --phase0-cache artifacts/phase0_queries.csv \
+  --phase3-api solar --listwise --listwise-n 10 \
+  --output artifacts/sample_submission_j1.csv
+
+# 이후: Reranker 재실행 없이 파라미터만 바꿔 빠른 실험 (MAP 측정)
+python scripts/export_submission.py \
+  --pipeline --config config/default.yaml \
+  --phase2-cache artifacts/phase2_rerank.jsonl \
+  --phase3-api solar --listwise --listwise-n 5 --listwise-fewshot \
+  --skip-generation \
+  --output artifacts/sample_submission_j1_n5_fs.csv
+
+# preserve_top1 비활성 실험
+python scripts/export_submission.py \
+  --pipeline --config config/default.yaml \
+  --phase2-cache artifacts/phase2_rerank.jsonl \
+  --phase3-api solar --listwise --listwise-n 10 --no-preserve-top1 \
+  --skip-generation \
+  --output artifacts/sample_submission_j1_nopt1.csv
+```
+
+**결과**
+
+| 설정                            | MAP        | MRR        | 비고                                     |
+| ------------------------------- | ---------- | ---------- | ---------------------------------------- |
+| Listwise ON (`--listwise-n 3`)  | **0.9417** | **0.9485** | MRR은 높으나 MAP은 OFF 대비 낮음         |
+| Listwise OFF (Reranker 기준)    | **0.9447** | **0.9470** | **현재 최고 MAP** — G-6 파이프라인 최적  |
+
+**결론**: Listwise를 끈 G-6 설정(BM25:Dense 6:4, Phase 2.5 미사용)이 최고 성능. Listwise 재정렬 적용 시 MAP이 오히려 하락(−0.0030).
 
 ---
 
@@ -488,32 +560,33 @@ python scripts/export_submission.py \
 
 ## 전체 실행 순서 요약
 
-| 순서 | Phase  | 스크립트                                                     | 상태      | 비고                                                                           |
-| ---- | ------ | ------------------------------------------------------------ | --------- | ------------------------------------------------------------------------------ |
-| 0    | 인프라 | `index_qdrant.py`                                            | ✅ 완료   | 4,272건 Qdrant 인덱싱                                                          |
-| 1    | A-1    | `build_sft_from_docs.py`                                     | ✅ 완료   | 1,747건 / 통과율 87.4%                                                         |
-| 2    | B-1·2  | `build_sft_data.py` → 혼합                                   | ✅ 완료   | 1,905건 → `sft_data_final.jsonl`                                               |
-| 3    | C-1    | `train_sft.py`                                               | ✅ 완료   | 4B SFT — 오염으로 폐기, 9B 기본 모델 전환                                      |
-| 4    | E-1    | `export_submission.py`                                       | ✅ 완료   | MAP=0.3864 — Dense 오염 지속 확인                                              |
-| 6    | F-1    | `build_doc_metadata.py`                                      | ✅ 완료   | 4,272건 메타 생성 → `doc_metadata.jsonl`                                       |
-| 7    | F-2a   | `build_synonyms.py`                                          | ✅ 완료   | 동의어 233개 규칙 → `science_synonyms.txt`                                     |
-| 8    | F-2b   | `index_es.py --lm-jelinek-mercer --recreate`                 | ✅ 완료   | LMJelinekMercer + 동의어 + 멀티필드 적용                                       |
-| 9    | B-3a   | `build_reranker_triplets.py`                                 | ✅ 완료   | 1,747건 트리플렛 → `reranker_triplets.jsonl`                                   |
-| 10   | B-3b   | `train_reranker.py`                                          | ✅ 완료   | 리더보드 MAP=MRR=0.2439 — Reranker 단독 교체 제출                              |
-| 11   | G-1    | `export_submission.py --llm-select`                          | ✅ 완료   | 리더보드 MAP=MRR=0.8795 — 목표 0.85+ 달성                                      |
-| 12   | G-2    | `export_submission.py` `--rrf-weights` + Phase0 Solar 캐시   | ✅ 완료   | 리더보드 MAP=0.8386 / MRR=0.8424 (`phase0_queries_llm_select_total_solar.csv`) |
-| 13   | G-3    | `export_submission.py` 검색·리랭크 튜닝, `--llm-select` 없음 | ✅ 완료   | 리더보드 MAP=0.925 / MRR=0.9242 — Phase 2.5 비활성, Reranker 출력 기준         |
-| 14   | F-2c   | `index_es.py --recreate` (사용자사전·동의어 보완)            | ✅ 완료   | 주요 검색 오류 해결 목적                                                       |
-| 15   | F-3    | `index_qdrant.py` (Embedding Instruction 강화 후 재인덱싱)   | ✅ 완료   | 과학 도메인 특화 프롬프트 적용                                                 |
-| 16   | G-4    | `export_submission.py` boost 튜닝 (Content^3.5)              | ✅ 완료   | 리더보드 **MAP=0.9250 / MRR=0.9273** — G-5 이전 최고                        |
-| 17   | G-5    | 동의어 사전 한-영만·한-한 축소 → `index_es.py` 재색인 → 제출( `--llm-select` 없음) | ✅ 완료   | 리더보드 **MAP=0.9311** — **현재 최고**                                        |
-| 18   | B-3c   | `train_reranker.py` (negatives 오탐 226개 제거 후)           | ✅ 완료   | 성능 개선 없음 (G-5 대비 동일)                                                 |
-| 19   | H-2    | Phase 0 쿼리 개선 실험 (HyDE 문체 + 단일턴 재작성)           | ✅ 완료   | 두 변경 모두 하락 → 롤백. G-5 유지                                             |
-| 20   | I-1    | `build_doc_metadata.py` 프롬프트 개선 + `doc_metadata_v2.jsonl` 재생성 + ES 재인덱싱 | ✅ 완료   | **MAP=0.9311 / MRR=0.9333** — 변화 없음                          |
-| 21   | G-6    | `export_submission.py` BM25:Dense **6:4** (`--bm25-weight 0.6 --dense-weight 0.4`) | ✅ 완료   | **MAP=0.9356** — **최고 성적 갱신**                               |
-| 22   | D      | `serve_app.py` + `static/index.html`                         | ⬜ 미시작 | 서빙 UI — 미진행                                                               |
+| 순서 | Phase  | 스크립트                                                                             | 상태       | 비고                                                                           |
+| ---- | ------ | ------------------------------------------------------------------------------------ | ---------- | ------------------------------------------------------------------------------ |
+| 0    | 인프라 | `index_qdrant.py`                                                                    | ✅ 완료    | 4,272건 Qdrant 인덱싱                                                          |
+| 1    | A-1    | `build_sft_from_docs.py`                                                             | ✅ 완료    | 1,747건 / 통과율 87.4%                                                         |
+| 2    | B-1·2  | `build_sft_data.py` → 혼합                                                           | ✅ 완료    | 1,905건 → `sft_data_final.jsonl`                                               |
+| 3    | C-1    | `train_sft.py`                                                                       | ✅ 완료    | 4B SFT — 오염으로 폐기, 9B 기본 모델 전환                                      |
+| 4    | E-1    | `export_submission.py`                                                               | ✅ 완료    | MAP=0.3864 — Dense 오염 지속 확인                                              |
+| 6    | F-1    | `build_doc_metadata.py`                                                              | ✅ 완료    | 4,272건 메타 생성 → `doc_metadata.jsonl`                                       |
+| 7    | F-2a   | `build_synonyms.py`                                                                  | ✅ 완료    | 동의어 233개 규칙 → `science_synonyms.txt`                                     |
+| 8    | F-2b   | `index_es.py --lm-jelinek-mercer --recreate`                                         | ✅ 완료    | LMJelinekMercer + 동의어 + 멀티필드 적용                                       |
+| 9    | B-3a   | `build_reranker_triplets.py`                                                         | ✅ 완료    | 1,747건 트리플렛 → `reranker_triplets.jsonl`                                   |
+| 10   | B-3b   | `train_reranker.py`                                                                  | ✅ 완료    | 리더보드 MAP=MRR=0.2439 — Reranker 단독 교체 제출                              |
+| 11   | G-1    | `export_submission.py --llm-select`                                                  | ✅ 완료    | 리더보드 MAP=MRR=0.8795 — 목표 0.85+ 달성                                      |
+| 12   | G-2    | `export_submission.py` `--rrf-weights` + Phase0 Solar 캐시                           | ✅ 완료    | 리더보드 MAP=0.8386 / MRR=0.8424 (`phase0_queries_llm_select_total_solar.csv`) |
+| 13   | G-3    | `export_submission.py` 검색·리랭크 튜닝, `--llm-select` 없음                         | ✅ 완료    | 리더보드 MAP=0.925 / MRR=0.9242 — Phase 2.5 비활성, Reranker 출력 기준         |
+| 14   | F-2c   | `index_es.py --recreate` (사용자사전·동의어 보완)                                    | ✅ 완료    | 주요 검색 오류 해결 목적                                                       |
+| 15   | F-3    | `index_qdrant.py` (Embedding Instruction 강화 후 재인덱싱)                           | ✅ 완료    | 과학 도메인 특화 프롬프트 적용                                                 |
+| 16   | G-4    | `export_submission.py` boost 튜닝 (Content^3.5)                                      | ✅ 완료    | 리더보드 **MAP=0.9250 / MRR=0.9273** — G-5 이전 최고                           |
+| 17   | G-5    | 동의어 사전 한-영만·한-한 축소 → `index_es.py` 재색인 → 제출( `--llm-select` 없음)   | ✅ 완료    | 리더보드 **MAP=0.9311** — **현재 최고**                                        |
+| 18   | B-3c   | `train_reranker.py` (negatives 오탐 226개 제거 후)                                   | ✅ 완료    | 성능 개선 없음 (G-5 대비 동일)                                                 |
+| 19   | H-2    | Phase 0 쿼리 개선 실험 (HyDE 문체 + 단일턴 재작성)                                   | ✅ 완료    | 두 변경 모두 하락 → 롤백. G-5 유지                                             |
+| 20   | I-1    | `build_doc_metadata.py` 프롬프트 개선 + `doc_metadata_v2.jsonl` 재생성 + ES 재인덱싱 | ✅ 완료    | **MAP=0.9311 / MRR=0.9333** — 변화 없음                                        |
+| 21   | G-6    | `export_submission.py` BM25:Dense **6:4** (`--bm25-weight 0.6 --dense-weight 0.4`)   | ✅ 완료    | **MAP=0.9356** — **최고 성적 갱신**                                            |
+| 22   | J-1    | `export_submission.py --listwise` (Solar API listwise 재정렬, n=3, `--phase2-cache` 캐시) | ✅ 완료    | listwise ON: MAP=0.9417/MRR=0.9485, OFF: MAP=0.9447/MRR=0.9470 → **OFF(G-6)가 최고**             |
+| 23   | D      | `serve_app.py` + `static/index.html`                                                 | ⬜ 미시작  | 서빙 UI — 미진행                                                               |
 
-> **최종 결론 (2026-04-23)**: **G-6(MAP=0.9356)** 이 현재 최고 성능. G-5(7:3) 대비 Dense 비중을 6:4로 상향하여 추가 개선 확인.
+> **최종 결론 (2026-04-23)**: **G-6 Listwise OFF(MAP=0.9447 / MRR=0.9470)** 가 현재 최고 성능. Listwise(J-1) 실험 완료 — listwise 적용 시 오히려 MAP 하락 확인.
 
 ---
 
@@ -775,6 +848,19 @@ python scripts/export_submission.py \
   --phase0-cache artifacts/phase0_queries.csv \
   --skip-generation \
   --output artifacts/sample_submission_f2_retrieval.csv
+
+# J-1 Listwise 실험
+# 1회차: 전체 실행 (Phase 2 캐시 자동 저장됨)
+python scripts/export_submission.py --pipeline --config config/default.yaml \
+  --phase0-cache artifacts/phase0_queries.csv \
+  --phase3-api solar --listwise --listwise-n 10 \
+  --output artifacts/sample_submission_lw.csv
+
+# 이후: Reranker 재실행 없이 파라미터만 바꿔 빠른 실험
+python scripts/export_submission.py --pipeline --config config/default.yaml \
+  --phase2-cache artifacts/phase2_rerank.jsonl \
+  --phase3-api solar --listwise --listwise-n 5 --listwise-fewshot \
+  --skip-generation --output artifacts/sample_submission_lw_n5_fs.csv
 ```
 
 ```yaml
