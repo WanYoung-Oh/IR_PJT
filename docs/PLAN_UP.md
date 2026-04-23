@@ -1,8 +1,10 @@
 # RAG 파이프라인 개선 계획
 
-> **최종 결과**: 베이스라인 0.6682 → **MAP=0.9311 / MRR=0.9333** (G-5, 2026-04-22) — 참조 팀(0.9288) 초과. **프로젝트 완료.**
+> **최종 결과**: 베이스라인 0.6682 → **MAP=0.9356** (G-6, 2026-04-23) — BM25:Dense 6:4 비율 조정으로 G-5(0.9311) 대비 추가 개선.
 >
-> **갱신 (2026-04-22, 최종)**: 문서 메타데이터 프롬프트 개선(I-1) — `build_doc_metadata.py` 카테고리 버그 수정·src 도메인 힌트·keywords 영어 병기·summary hallucination 방지 적용 후 `doc_metadata_v2.jsonl` 재생성 → ES 재인덱싱 → **MAP=0.9311 / MRR=0.9333** (변화 없음). Phase 0 쿼리 품질 개선 실험(H-2) — ① HyDE 프롬프트 교과서 문체 변경 + 단일턴 standalone 재작성 동시 적용 → **MAP=0.8356** (하락). ② HyDE 프롬프트 단독 변경 → **MAP=0.9250** (하락). 두 변경 모두 롤백. `--llm-select` G-5 인덱스 재실험 → **MAP=0.8 대** (하락). top-k·Reranker 가중치·BM25:Dense 비율 재탐색 모두 G-5 대비 개선 없음. **G-5(MAP=0.9311 / MRR=0.9333)를 최종 제출로 확정.**
+> **갱신 (2026-04-23)**: BM25:Dense 비율 **6:4** 실험(G-6) — G-5(7:3) 대비 Dense 비중 상향 → **MAP=0.9356** (최고 성적 갱신).
+>
+> **갱신 (2026-04-22, 이전 최고)**: 문서 메타데이터 프롬프트 개선(I-1) — `build_doc_metadata.py` 카테고리 버그 수정·src 도메인 힌트·keywords 영어 병기·summary hallucination 방지 적용 후 `doc_metadata_v2.jsonl` 재생성 → ES 재인덱싱 → **MAP=0.9311 / MRR=0.9333** (변화 없음). Phase 0 쿼리 품질 개선 실험(H-2) — ① HyDE 프롬프트 교과서 문체 변경 + 단일턴 standalone 재작성 동시 적용 → **MAP=0.8356** (하락). ② HyDE 프롬프트 단독 변경 → **MAP=0.9250** (하락). 두 변경 모두 롤백. `--llm-select` G-5 인덱스 재실험 → **MAP=0.8 대** (하락). top-k·Reranker 가중치·BM25:Dense 비율 재탐색 모두 G-5 대비 개선 없음. **G-5(MAP=0.9311 / MRR=0.9333)를 최종 제출로 확정.**
 >
 > **갱신 (2026-04-22)**: ES 동의어 사전 대폭 정리 — **한글↔한글 항목 삭제**, **한글↔영어 항목만 유지** 후 **ES 재색인** → G-4와 동일 파이프라인으로 제출( **`--llm-select` 비활성** ) — 리더보드 **MAP=0.9311** (실험 **G-5**, **최고 성능**).
 >
@@ -63,6 +65,7 @@
 | B-3c   | Reranker SFT 재학습 (negatives 오탐 226개 제거)                          | ✅ 완료 | 재학습 완료 — 성능 개선 없음 (G-5 대비 동일 수준)                                          |
 | H-2    | Phase 0 쿼리 품질 개선 실험 (HyDE 문체 + 단일턴 standalone 재작성)       | ✅ 완료 | ① HyDE+standalone 동시 → **MAP=0.8356** (하락) ② HyDE 단독 → **MAP=0.9250** (하락) → 롤백 |
 | I-1    | `build_doc_metadata.py` 프롬프트 개선 → `doc_metadata_v2.jsonl` + ES 재인덱싱 | ✅ 완료 | 카테고리 버그 수정·src 힌트·영어 병기·hallucination 방지 — **MAP=0.9311 / MRR=0.9333** (변화 없음) |
+| G-6    | BM25:Dense 비율 **6:4** 조정 (G-5 인덱스 재사용, Phase 2.5 끔)               | ✅ 완료 | **MAP=0.9356** — **최고 성적 갱신**                                                                  |
 
 ### 주요 이슈 해결 기록
 
@@ -89,7 +92,8 @@
 | G-5  | G-4 색인·파이프라인 동일, ES 동의어 사전 한-한 항목 대폭 삭제·한-영만 유지 후 **재색인** · **Phase 2.5 미사용**                                 | **0.9311** | **0.9333** | **최종 최고**                                                                                     |
 | H-2a | G-5 인덱스 기반, HyDE 프롬프트 교과서 문체 변경 + 단일턴 standalone 재작성 추가                                                                | **0.8356** | —          | Phase 0 쿼리 품질 개선 실험 — 대폭 하락 (단일턴 재작성 180건 과도 변형)                          |
 | H-2b | G-5 인덱스 기반, HyDE 프롬프트 교과서 문체 변경만 (standalone 재작성 롤백)                                                                     | **0.9250** | —          | HyDE 단독 변경 — 하락. 두 변경 모두 롤백, G-5 유지                                               |
-| I-1  | `doc_metadata_v2.jsonl` (카테고리 버그 수정·src 힌트·영어 병기·hallucination 방지) + ES 재인덱싱                                               | **0.9311** | **0.9333** | 변화 없음 — 성능 한계 확인, 프로젝트 완료                                                        |
+| I-1  | `doc_metadata_v2.jsonl` (카테고리 버그 수정·src 힌트·영어 병기·hallucination 방지) + ES 재인덱싱                                               | **0.9311** | **0.9333** | 변화 없음                                                                                         |
+| G-6  | G-5 인덱스 기반, BM25:Dense **6:4** (Dense 비중 상향) · Phase 2.5 미사용                                                                      | **0.9356** | —          | **최고 성적 갱신**                                                                                |
 
 ### Dense 오염 패턴 분석
 
@@ -400,6 +404,17 @@ python scripts/run_competition_map.py \
 | `summary`  | ^1.2       | **^1.2** (유지) |
 | `content`  | ^1.2       | **^3.5** (상향) |
 
+**keywords boost 추가 실험** (로컬 MAP 기준, Phase 0 캐시 재사용):
+
+| `keywords` boost | 로컬 MAP | 비고 |
+| ---------------- | -------- | ---- |
+| ^1.5             | **0.925** (G-3/G-4 기준) | **최상** — 현재 적용값 |
+| ^2               | 0.925    | ^1.5와 동일 수준 |
+| ^2.5             | 0.922    | 소폭 하락 |
+| ^3               | 0.9242   | 하락 |
+
+> **결론**: `Keywords^1.5`가 최적. 부스트 상향 시 오히려 precision 저하. G-4 설정 유지 확정.
+
 **결과**: 리더보드 **MAP=0.9250 / MRR=0.9273** — G-5 이전 최고
 
 ---
@@ -416,6 +431,34 @@ python scripts/run_competition_map.py \
 **제출**: G-4와 동일 `export_submission.py` 파이프라인, **`--llm-select` 미사용**(Reranker 출력 기준).
 
 **결과**: 리더보드 **MAP=0.9311 / MRR=0.9333** — **최종 최고 성능**(참조 팀 0.9288 대비 상회).
+
+---
+
+## Phase G-6 — BM25:Dense 6:4 비율 조정 ✅ 완료
+
+**목적**: G-5(7:3) 대비 Dense 비중을 높여 하이브리드 검색 최적 비율 탐색.
+
+**변경 내용**
+
+| 항목           | G-5 (이전) | G-6 (변경)  |
+| -------------- | ---------- | ----------- |
+| BM25 가중치    | 0.7        | **0.6**     |
+| Dense 가중치   | 0.3        | **0.4**     |
+| 인덱스·파이프라인 | G-5 동일  | G-5 동일    |
+| Phase 2.5      | 미사용     | 미사용      |
+
+**실행 명령**
+
+```bash
+python scripts/export_submission.py \
+  --pipeline --config config/default.yaml \
+  --bm25-weight 0.6 --dense-weight 0.4 \
+  --multi-field \
+  --phase0-cache artifacts/phase0_queries.csv \
+  --output artifacts/sample_submission_g6.csv
+```
+
+**결과**: **MAP=0.9356** — **최고 성적 갱신** (G-5 대비 +0.0045)
 
 ---
 
@@ -467,9 +510,10 @@ python scripts/run_competition_map.py \
 | 18   | B-3c   | `train_reranker.py` (negatives 오탐 226개 제거 후)           | ✅ 완료   | 성능 개선 없음 (G-5 대비 동일)                                                 |
 | 19   | H-2    | Phase 0 쿼리 개선 실험 (HyDE 문체 + 단일턴 재작성)           | ✅ 완료   | 두 변경 모두 하락 → 롤백. G-5 유지                                             |
 | 20   | I-1    | `build_doc_metadata.py` 프롬프트 개선 + `doc_metadata_v2.jsonl` 재생성 + ES 재인덱싱 | ✅ 완료   | **MAP=0.9311 / MRR=0.9333** — 변화 없음                          |
-| 21   | D      | `serve_app.py` + `static/index.html`                         | ⬜ 미시작 | 서빙 UI — 미진행                                                               |
+| 21   | G-6    | `export_submission.py` BM25:Dense **6:4** (`--bm25-weight 0.6 --dense-weight 0.4`) | ✅ 완료   | **MAP=0.9356** — **최고 성적 갱신**                               |
+| 22   | D      | `serve_app.py` + `static/index.html`                         | ⬜ 미시작 | 서빙 UI — 미진행                                                               |
 
-> **최종 결론 (2026-04-22)**: **G-5(MAP=0.9311 / MRR=0.9333)** 가 최종 최고 성능. 이후 모든 추가 실험(B-3c·H-2·I-1·llm-select 재실험·top-k·가중치 재탐색)에서 G-5 대비 개선 없음. **프로젝트 완료.**
+> **최종 결론 (2026-04-23)**: **G-6(MAP=0.9356)** 이 현재 최고 성능. G-5(7:3) 대비 Dense 비중을 6:4로 상향하여 추가 개선 확인.
 
 ---
 

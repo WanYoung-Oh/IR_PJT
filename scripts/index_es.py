@@ -79,7 +79,7 @@ def main() -> None:
         print(f"메타 정보 로드: {len(meta_map)}건 → {meta_path}")
 
     if args.lm_jelinek_mercer:
-        print("유사도 알고리즘: LMJelinekMercer (λ=0.7)")
+        print("유사도 알고리즘: LMJelinekMercer (λ=0.69)")
     else:
         print("유사도 알고리즘: BM25 (기본)")
 

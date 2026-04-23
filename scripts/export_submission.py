@@ -21,10 +21,20 @@
     # standalone / HyDE / alt 3축 RRF 가중치 (기본은 균등 1,1,1)
     python scripts/export_submission.py --pipeline --config config/default.yaml \\
       --rrf-weights 0.5,0.25,0.25
+
+    # Phase 2.5 Listwise 재정렬 활성화 (Solar API)
+    python scripts/export_submission.py --pipeline --config config/default.yaml \\
+      --phase0-cache artifacts/phase0_queries.csv --phase3-api solar --listwise
+
+    # Phase 2 캐시 재사용 (Reranker 재실행 없이 Listwise 파라미터 튜닝)
+    python scripts/export_submission.py --pipeline --config config/default.yaml \\
+      --phase2-cache artifacts/phase2_rerank.jsonl --phase3-api solar \\
+      --listwise --listwise-n 10 --listwise-fewshot --skip-generation
 """
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 import uuid
@@ -41,6 +51,7 @@ load_dotenv(ROOT / ".env")
 from ir_rag.config import load_config, repo_root_from, resolve_config_path
 from ir_rag.generator import format_context, generate_chitchat, generate_with_selfcheck
 from ir_rag.io_util import iter_jsonl, write_jsonl
+from ir_rag.listwise_reranker import listwise_rerank
 from ir_rag.llm_openai_chat import OpenAIChatCompletionLLM
 from ir_rag.query_rewrite import build_search_query, generate_alt_query, is_science_question
 from ir_rag.reranker import load_reranker, rerank_with_crossencoder, soft_voting_rerank
@@ -55,9 +66,6 @@ from ir_rag.submission import SubmissionRecord, validate_submission_row
 from ir_rag.vram import unload_model
 
 logger = logging.getLogger(__name__)
-
-# Phase 2.5: 리랭커 topk_ids 중 LLM 선별에만 넘기는 상위 슬롯 수 (전문 프롬프트로 토큰 부담 완화)
-_LLM_SELECT_RERANK_POOL = 5
 
 
 def _configure_reproducibility(seed: int) -> None:
@@ -98,83 +106,15 @@ def _configure_reproducibility(seed: int) -> None:
     )
 
 
-def _llm_select_docs(
-    query: str,
-    candidate_ids: list[str],
-    doc_map: dict[str, str],
-    llm: Any,
-    top_k: int = 3,
-) -> list[str]:
-    """Phase 2.5: LLM 프롬프트로 top-k 문서를 선별한다.
-
-    ``candidate_ids`` 는 보통 리랭커 상위 ``_LLM_SELECT_RERANK_POOL`` 슬롯만 넘긴다.
-    각 후보는 ``doc_map`` 의 **전체 본문**을 프롬프트에 포함한다 (스니펫 없음).
-    파싱 실패 또는 선별 수 부족 시 ``candidate_ids[:top_k]`` 폴백.
-
-    Parameters
-    ----------
-    candidate_ids:
-        Reranker 순서가 반영된 docid 목록 (상위 N개만 호출부에서 잘라 넣음).
-    doc_map:
-        docid → 본문 매핑.
-    llm:
-        ``llm.complete(prompt)`` 인터페이스를 가진 LLM 객체.
-    """
-    import re
-
-    valid_ids = [d for d in candidate_ids if d in doc_map]
-    doc_blocks: list[str] = []
-    for i, did in enumerate(valid_ids, 1):
-        body = (doc_map.get(did) or "").strip()
-        if not body:
-            body = "[내용 없음]"
-        doc_blocks.append(f"[문서 {i}]\n{body}")
-    doc_list = "\n\n---\n\n".join(doc_blocks)
-
-    prompt = (
-        f"질문: {query}\n\n"
-        f"아래는 후보 문서 {len(valid_ids)}개입니다. [문서 i] 번호는 리랭커 상위 순서와 같습니다.\n"
-        f"각 본문 전체를 읽고, 질문에 가장 정확하게 답할 수 있는 문서 {top_k}개를 고르세요.\n"
-        f"문서 번호만 콤마로 구분하여 출력하세요. 예: 1, 3, 5\n\n"
-        f"{doc_list}\n\n"
-        f"선택한 문서 번호 ({top_k}개):"
-    )
-    try:
-        raw = llm.complete(prompt).text
-        # <think> 태그 제거
-        raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
-        # 숫자 파싱
-        nums = [int(x.strip()) for x in re.split(r"[,\s]+", raw) if x.strip().isdigit()]
-        # 유효 범위 필터 (1-indexed)
-        selected = [valid_ids[n - 1] for n in nums if 1 <= n <= len(valid_ids)]
-        # 중복 제거, top_k개 확보
-        seen: set[str] = set()
-        result = []
-        for did in selected:
-            if did not in seen:
-                seen.add(did)
-                result.append(did)
-            if len(result) >= top_k:
-                break
-        if len(result) >= top_k:
-            return result
-    except Exception as e:
-        logger.warning("LLM 문서 선별 실패, Reranker 순 폴백: %s", e)
-    # 폴백: Reranker 점수 순 상위 top_k
-    return valid_ids[:top_k]
-
-
 def _dump_phase2_topk(
     rerank_results: list[dict],
     eid: int,
     path: Path,
     *,
     skip_generation: bool,
-    llm_select_after_gate: bool,
+    listwise_after_gate: bool,
 ) -> None:
     """Phase 2 직후 특정 eval_id의 topk_ids 앞 5개를 JSON으로 저장한다."""
-    import json
-
     for r in rerank_results:
         if r.get("eid") != eid:
             continue
@@ -185,7 +125,7 @@ def _dump_phase2_topk(
             "topk_ids_first5": topk[:5],
             "meta": {
                 "skip_generation": skip_generation,
-                "llm_select_effective_next": llm_select_after_gate,
+                "listwise_effective_next": listwise_after_gate,
             },
         }
         path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -213,7 +153,10 @@ def run_pipeline(
     bm25_weight: float = 0.7,
     dense_weight: float = 0.3,
     phase0_cache: Path | None = None,
-    llm_select: bool = False,
+    listwise: bool = False,
+    listwise_n: int = 10,
+    listwise_preserve_top1: bool = True,
+    listwise_fewshot: bool = False,
     use_multi_field: bool = False,
     skip_generation: bool = False,
     phase0_backend: str = "hf",
@@ -222,300 +165,338 @@ def run_pipeline(
     seed: int = 42,
     dump_phase2_eid: int | None = None,
     dump_phase2_path: Path | None = None,
-    retrieval_only_llm_select: bool = False,
+    phase2_cache: Path | None = None,
 ) -> list[dict]:
     """전체 RAG 파이프라인을 실행하여 제출 행 목록을 반환한다.
 
     24GB VRAM 제약으로 인해 순차 로드 방식으로 동작한다:
       Phase 0.   LLM 로드 → 쿼리 재작성 + HyDE doc/alt_query 생성 → 언로드
       Phase 1.   임베딩 모델 로드 → BM25+Dense RRF(k=20) → 언로드
-      Phase 2.   Reranker 로드 → 전체 리랭킹 → 언로드
-      Phase 2.5. (llm_select=True) LLM 로드 → 리랭커 상위 N개 전문으로 top-k 선별 → 언로드
+      Phase 2.   Reranker 로드 → 전체 리랭킹 → 언로드 → artifacts/phase2_rerank.jsonl 자동 저장
+      Phase 2.5. (listwise=True) Solar API로 listwise 재정렬 (GPU 불필요)
       Phase 3.   LLM 로드 → 전체 답변 생성 → 언로드  ← skip_generation=True 시 생략
+
+    Phase 2 캐시 재사용 (빠른 Phase 2.5 파라미터 튜닝):
+      --phase2-cache artifacts/phase2_rerank.jsonl 지정 시 Phase 0-2를 건너뛰고
+      Phase 2.5부터 시작한다. Reranker 재실행 없이 listwise_n / preserve_top1 /
+      listwise_fewshot 조합을 빠르게 반복 실험할 수 있다.
 
     Parameters
     ----------
     skip_dense:
         True 이면 Dense(Qdrant) 검색을 생략하고 BM25 단독 검색을 사용한다.
-        Dense 인덱스 오염 확인 후 기본값으로 사용 권장.
     skip_generation:
         True 이면 Phase 3 LLM 답변 생성을 생략한다.
         topk 문서 선별에만 집중하는 검색 실험 시 사용. 답변은 placeholder로 대체.
-        Phase 0도 --phase0-cache와 함께 사용하면 LLM 로드 없이 검색+재순위만 실행.
-    llm_select:
-        True 이면 Phase 2.5를 활성화한다. 리랭커 상위 ``_LLM_SELECT_RERANK_POOL``개의
-        전체 본문만 LLM에 넘겨 최종 문서를 선별한다.
-        skip_generation=True 이면 기본적으로 비활성화된다.
-        retrieval_only_llm_select=True 이면 skip_generation과 함께 켤 수 있다.
+    listwise:
+        True 이면 Phase 2.5를 활성화한다. Reranker topk 중 상위 listwise_n개를
+        Solar API (LLM)가 listwise 재정렬하여 최종 top_k_submit개를 선택한다.
+    listwise_n:
+        Listwise 재정렬에 넘기는 Reranker 상위 후보 수 (기본 10).
+    listwise_preserve_top1:
+        True이면 Reranker top-1 문서를 항상 1위로 고정 (안전 모드, 기본 True).
+    listwise_fewshot:
+        True이면 few-shot 예시 2개를 프롬프트에 포함.
     use_multi_field:
         True 이면 BM25 검색 시 title/keywords/summary/content 멀티필드 쿼리를 사용한다.
-        F-2 메타 색인 완료 후 활성화한다.
     phase0_backend:
-        ``"hf"`` (기본) 로컬 HuggingFace LLM, ``"solar"`` Solar Pro API
-        (standalone / HyDE / alt_query / 과학 판별).
+        ``"hf"`` (기본) 로컬 HuggingFace LLM, ``"solar"`` Solar Pro API.
     phase3_backend:
-        ``"hf"`` (기본) 로컬 LLM, ``"solar"`` Solar Pro API (answer 생성 및
-        ``--llm-select`` 시 문서 선별).
+        ``"hf"`` (기본) 로컬 LLM, ``"solar"`` Solar Pro API.
+        listwise Phase 2.5도 이 백엔드를 사용한다.
     axis_rrf_weights:
         ``(standalone, HyDE, alt_query)`` 순서의 Phase 1 다축 RRF 가중치.
-        ``None`` 이면 균등 ``(1.0, 1.0, 1.0)``. 2축일 때는 (standalone, 존재하는 축)에 매핑.
+        ``None`` 이면 균등 ``(1.0, 1.0, 1.0)``.
+    phase2_cache:
+        지정 시 artifacts/phase2_rerank.jsonl 을 로드하여 Phase 0-2를 건너뛴다.
+        Reranker 재실행 없이 Phase 2.5 파라미터만 바꿔 빠르게 재실험할 때 사용.
     seed:
-        ``random`` / NumPy / PyTorch 시드 및 cuDNN 결정적 모드. 임베딩·리랭커 로드 **전**에 적용.
+        random / NumPy / PyTorch 시드 및 cuDNN 결정적 모드.
     """
     _configure_reproducibility(seed)
 
-    from elasticsearch import Elasticsearch
-    from qdrant_client import QdrantClient
-
-    from ir_rag.embeddings import build_huggingface_embedding
-
-    eval_path = root / cfg["paths"]["eval"]
     doc_path = root / cfg["paths"]["documents"]
-
     doc_map: dict[str, str] = {d["docid"]: d["content"] for d in iter_jsonl(doc_path)}
-    uuid_to_docid = build_uuid_to_docid(str(doc_path))
-    print(f"UUID→docid 역매핑 {len(uuid_to_docid)}건 로드")
-    samples = list(iter_jsonl(eval_path))
 
-    es = Elasticsearch(cfg["elasticsearch"]["url"])
-    es_index = cfg["elasticsearch"]["index"]
-    qdrant = QdrantClient(url=cfg["qdrant"]["url"])
-    qdrant_coll = cfg["qdrant"]["collection"]
+    # ── Phase 2 캐시 로드 시 Phase 0-2 전체 생략 ─────────────────────────────
+    if phase2_cache is not None:
+        print(f"=== Phase 2 캐시 로드 (Phase 0-2 생략): {phase2_cache} ===")
+        rerank_results: list[dict] = []
+        with open(phase2_cache, encoding="utf-8") as _pf:
+            for _line in _pf:
+                _line = _line.strip()
+                if not _line:
+                    continue
+                _rec = json.loads(_line)
+                rerank_results.append({
+                    "eid": _rec["eval_id"],
+                    "standalone": _rec["standalone"],
+                    "is_science": _rec["is_science"],
+                    "msg": _rec["msg"],
+                    "topk_ids": _rec["topk_ids"],
+                    "combined": _rec["combined"],
+                })
+        print(f"  캐시 로드 완료 ({len(rerank_results)}건)\n")
 
-    # ── Phase 0: LLM으로 쿼리 재작성 (멀티턴만) ─────────────────────────────
-    standalone_queries: list[dict] = []
-    if phase0_cache is not None:
-        print(f"=== Phase 0: 건너뜀 (캐시 파일 사용: {phase0_cache}) ===")
-        import csv as _csv
-        # eval_id → msg 매핑 (msg는 CSV에 없으므로 eval.jsonl에서 로드)
-        msg_map: dict[int, list] = {int(s["eval_id"]): s["msg"] for s in samples}
-        with open(phase0_cache, newline="", encoding="utf-8") as f:
-            reader = _csv.DictReader(f)
-            for row in reader:
-                eid = int(row["eval_id"])
-                is_science = row["is_science"].strip().lower() in ("true", "1", "yes")
+    else:
+        # ── 정상 경로: Phase 0 → 1 → 2 ──────────────────────────────────────
+        from elasticsearch import Elasticsearch
+        from qdrant_client import QdrantClient
+
+        from ir_rag.embeddings import build_huggingface_embedding
+
+        eval_path = root / cfg["paths"]["eval"]
+        uuid_to_docid = build_uuid_to_docid(str(doc_path))
+        print(f"UUID→docid 역매핑 {len(uuid_to_docid)}건 로드")
+        samples = list(iter_jsonl(eval_path))
+
+        es = Elasticsearch(cfg["elasticsearch"]["url"])
+        es_index = cfg["elasticsearch"]["index"]
+        qdrant = QdrantClient(url=cfg["qdrant"]["url"])
+        qdrant_coll = cfg["qdrant"]["collection"]
+
+        # ── Phase 0: LLM으로 쿼리 재작성 (멀티턴만) ─────────────────────────
+        standalone_queries: list[dict] = []
+        if phase0_cache is not None:
+            print(f"=== Phase 0: 건너뜀 (캐시 파일 사용: {phase0_cache}) ===")
+            import csv as _csv
+            msg_map: dict[int, list] = {int(s["eval_id"]): s["msg"] for s in samples}
+            with open(phase0_cache, newline="", encoding="utf-8") as f:
+                reader = _csv.DictReader(f)
+                for row in reader:
+                    eid = int(row["eval_id"])
+                    is_science = row["is_science"].strip().lower() in ("true", "1", "yes")
+                    standalone_queries.append({
+                        "eid": eid,
+                        "msg": msg_map[eid],
+                        "standalone": row["standalone"],
+                        "is_science": is_science,
+                        "hyde_doc": row.get("hyde_doc", ""),
+                        "alt_query": row.get("alt_query", ""),
+                    })
+            print(f"  캐시 로드 완료 ({len(standalone_queries)}건)\n")
+        elif skip_rewrite:
+            print("=== Phase 0: 건너뜀 (--skip-rewrite) ===")
+            for sample in samples:
+                msg = sample["msg"]
                 standalone_queries.append({
-                    "eid": eid,
-                    "msg": msg_map[eid],
-                    "standalone": row["standalone"],
-                    "is_science": is_science,
-                    "hyde_doc": row.get("hyde_doc", ""),
-                    "alt_query": row.get("alt_query", ""),
+                    "eid": int(sample["eval_id"]),
+                    "msg": msg,
+                    "standalone": msg[-1]["content"],
+                    "is_science": True,
+                    "hyde_doc": "", "alt_query": "",
                 })
-        print(f"  캐시 로드 완료 ({len(standalone_queries)}건)\n")
-    elif skip_rewrite:
-        print("=== Phase 0: 건너뜀 (--skip-rewrite) ===")
-        for sample in samples:
-            msg = sample["msg"]
-            standalone_queries.append({
-                "eid": int(sample["eval_id"]),
-                "msg": msg,
-                "standalone": msg[-1]["content"],
-                "is_science": True,
-                "hyde_doc": "", "alt_query": "",   # skip_rewrite 시 HyDE 없이 1축 동작
-            })
-    else:
-        if phase0_backend == "solar":
-            print("=== Phase 0: Query Rewriting (Solar Pro API) ===")
         else:
-            print("=== Phase 0: Query Rewriting ===")
-        print("LLM 로드 중 (쿼리 재작성용) …")
-        llm = _load_reasoning_llm(cfg, phase0_backend)
-
-        for sample in samples:
-            eid = int(sample["eval_id"])
-            msg = sample["msg"]
-            science = is_science_question(msg, llm)
-            # 멀티턴만 standalone 재작성, 단일턴은 원본 그대로 사용
-            user_msgs = [m for m in msg if m["role"] == "user"]
-            if science and len(user_msgs) > 1:
-                standalone = build_search_query(msg, llm=llm)
+            if phase0_backend == "solar":
+                print("=== Phase 0: Query Rewriting (Solar Pro API) ===")
             else:
-                standalone = user_msgs[-1]["content"] if user_msgs else ""
+                print("=== Phase 0: Query Rewriting ===")
+            print("LLM 로드 중 (쿼리 재작성용) …")
+            llm = _load_reasoning_llm(cfg, phase0_backend)
 
-            # 과학 쿼리에 HyDE 문서 + alt_query 생성 (3축 BM25 RRF 활성화)
-            # <think> 태그는 strip 후 사용 (버리지 않음)
-            hyde_doc = ""
-            alt_query = ""
-            if science and standalone:
-                raw_hyde = generate_hyde_doc(standalone, llm)
-                import re as _re
-                hyde_doc = _re.sub(r"<redacted_thinking>.*?</redacted_thinking>", "", raw_hyde, flags=_re.DOTALL).strip()
-                try:
-                    alt_query = generate_alt_query(standalone, llm)
-                except Exception as e:
-                    print(f"  [경고] alt_query 생성 실패 (eval_id={eid}): {e}")
+            for sample in samples:
+                eid = int(sample["eval_id"])
+                msg = sample["msg"]
+                science = is_science_question(msg, llm)
+                user_msgs = [m for m in msg if m["role"] == "user"]
+                if science and len(user_msgs) > 1:
+                    standalone = build_search_query(msg, llm=llm)
+                else:
+                    standalone = user_msgs[-1]["content"] if user_msgs else ""
 
-            standalone_queries.append({
-                "eid": eid, "msg": msg, "standalone": standalone,
-                "is_science": science,
-                "hyde_doc": hyde_doc, "alt_query": alt_query,
-            })
-            tag = "과학" if science else "치챗"
-            turn = f"{len(user_msgs)}턴"
-            print(f"  [{eid}][{tag}][{turn}] {standalone[:60]}")
+                hyde_doc = ""
+                alt_query = ""
+                if science and standalone:
+                    raw_hyde = generate_hyde_doc(standalone, llm)
+                    import re as _re
+                    hyde_doc = _re.sub(r"<redacted_thinking>.*?</redacted_thinking>", "", raw_hyde, flags=_re.DOTALL).strip()
+                    try:
+                        alt_query = generate_alt_query(standalone, llm)
+                    except Exception as e:
+                        print(f"  [경고] alt_query 생성 실패 (eval_id={eid}): {e}")
 
-        llm = unload_model(llm)
-        print("LLM 언로드 완료\n")
-
-    # ── Phase 0 결과 중간 저장 (캐시 파일 지정 시 건너뜀) ───────────────────
-    import csv
-    phase0_out = root / "artifacts" / "phase0_queries.csv"
-    if phase0_cache is not None:
-        print(f"Phase 0 중간 저장 건너뜀 (캐시 파일 사용 중)\n")
-    else:
-        phase0_out.parent.mkdir(parents=True, exist_ok=True)
-        with phase0_out.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=["eval_id", "is_science", "standalone", "hyde_doc", "alt_query"])
-            writer.writeheader()
-            for sq in standalone_queries:
-                writer.writerow({
-                    "eval_id":    sq["eid"],
-                    "is_science": sq["is_science"],
-                    "standalone": sq["standalone"],
-                    "hyde_doc":   sq.get("hyde_doc", ""),
-                    "alt_query":  sq.get("alt_query", ""),
+                standalone_queries.append({
+                    "eid": eid, "msg": msg, "standalone": standalone,
+                    "is_science": science,
+                    "hyde_doc": hyde_doc, "alt_query": alt_query,
                 })
-        print(f"Phase 0 중간 저장 완료 → {phase0_out} ({len(standalone_queries)}건)\n")
+                tag = "과학" if science else "치챗"
+                turn = f"{len(user_msgs)}턴"
+                print(f"  [{eid}][{tag}][{turn}] {standalone[:60]}")
 
-    # ── Phase 1: 임베딩 모델로 전체 검색 ────────────────────────────────────
-    w0, w1, w2 = axis_rrf_weights if axis_rrf_weights is not None else (1.0, 1.0, 1.0)
-    print("=== Phase 1: Hybrid Retrieval ===")
-    print(f"  다축 RRF 가중치 (standalone / HyDE / alt): {w0:g}, {w1:g}, {w2:g}")
-    if skip_dense:
-        print("--skip-dense: BM25 단독 검색 (임베딩 모델 로드 생략)")
-        embed_model = None
+            llm = unload_model(llm)
+            print("LLM 언로드 완료\n")
 
-        def _hybrid_search(query: str) -> list[str]:
-            """BM25 단독 검색."""
-            bm25_ids = es_bm25_doc_ids(es, es_index, query, top_k_retrieve, use_multi_field=use_multi_field)
-            return list(rrf_score([bm25_ids]).keys())
-    else:
-        print("임베딩 모델 로드 중 …")
-        embed_model = build_huggingface_embedding(cfg["embedding"])
+        # ── Phase 0 결과 중간 저장 ───────────────────────────────────────────
+        import csv
+        phase0_out = root / "artifacts" / "phase0_queries.csv"
+        if phase0_cache is not None:
+            print(f"Phase 0 중간 저장 건너뜀 (캐시 파일 사용 중)\n")
+        else:
+            phase0_out.parent.mkdir(parents=True, exist_ok=True)
+            with phase0_out.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=["eval_id", "is_science", "standalone", "hyde_doc", "alt_query"])
+                writer.writeheader()
+                for sq in standalone_queries:
+                    writer.writerow({
+                        "eval_id":    sq["eid"],
+                        "is_science": sq["is_science"],
+                        "standalone": sq["standalone"],
+                        "hyde_doc":   sq.get("hyde_doc", ""),
+                        "alt_query":  sq.get("alt_query", ""),
+                    })
+            print(f"Phase 0 중간 저장 완료 → {phase0_out} ({len(standalone_queries)}건)\n")
 
-        def _hybrid_search(query: str) -> list[str]:
-            """BM25 + Dense → Weighted RRF 결과 docid 목록."""
-            vec = embed_model.get_query_embedding(query)
-            bm25_ids = es_bm25_doc_ids(es, es_index, query, top_k_retrieve, use_multi_field=use_multi_field)
-            dense_ids = qdrant_dense_doc_ids(qdrant, qdrant_coll, lambda _: vec, query, top_k_retrieve, uuid_to_docid=uuid_to_docid)
-            return list(rrf_score([bm25_ids, dense_ids], weights=[bm25_weight, dense_weight]).keys())
+        # ── Phase 1: 임베딩 모델로 전체 검색 ────────────────────────────────
+        w0, w1, w2 = axis_rrf_weights if axis_rrf_weights is not None else (1.0, 1.0, 1.0)
+        print("=== Phase 1: Hybrid Retrieval ===")
+        print(f"  다축 RRF 가중치 (standalone / HyDE / alt): {w0:g}, {w1:g}, {w2:g}")
+        if skip_dense:
+            print("--skip-dense: BM25 단독 검색 (임베딩 모델 로드 생략)")
+            embed_model = None
 
-    retrieval_results: list[dict] = []
-    for sq in standalone_queries:
-        eid, msg, standalone, science = sq["eid"], sq["msg"], sq["standalone"], sq["is_science"]
-        if not science:
+            def _hybrid_search(query: str) -> list[str]:
+                bm25_ids = es_bm25_doc_ids(es, es_index, query, top_k_retrieve, use_multi_field=use_multi_field)
+                return list(rrf_score([bm25_ids]).keys())
+        else:
+            print("임베딩 모델 로드 중 …")
+            embed_model = build_huggingface_embedding(cfg["embedding"])
+
+            def _hybrid_search(query: str) -> list[str]:
+                vec = embed_model.get_query_embedding(query)
+                bm25_ids = es_bm25_doc_ids(es, es_index, query, top_k_retrieve, use_multi_field=use_multi_field)
+                dense_ids = qdrant_dense_doc_ids(qdrant, qdrant_coll, lambda _: vec, query, top_k_retrieve, uuid_to_docid=uuid_to_docid)
+                return list(rrf_score([bm25_ids, dense_ids], weights=[bm25_weight, dense_weight]).keys())
+
+        retrieval_results: list[dict] = []
+        for sq in standalone_queries:
+            eid, msg, standalone, science = sq["eid"], sq["msg"], sq["standalone"], sq["is_science"]
+            if not science:
+                retrieval_results.append({
+                    "eid": eid, "msg": msg, "standalone": standalone,
+                    "rrf": {}, "candidate_ids": [], "is_science": False,
+                })
+                print(f"  [{eid}] 치챗 — 검색 건너뜀")
+                continue
+
+            original_ids = _hybrid_search(standalone)
+
+            import re as _re
+            hyde_doc = sq.get("hyde_doc", "") or ""
+            alt_query = sq.get("alt_query", "") or ""
+            if "<think>" in hyde_doc:
+                hyde_doc = _re.sub(r"<think>.*?</think>", "", hyde_doc, flags=_re.DOTALL).strip()
+            if "<think>" in alt_query:
+                alt_query = _re.sub(r"<think>.*?</think>", "", alt_query, flags=_re.DOTALL).strip()
+            if hyde_doc and alt_query:
+                hyde_ids = _hybrid_search(hyde_doc)
+                alt_ids = _hybrid_search(alt_query)
+                rrf = rrf_score([original_ids, hyde_ids, alt_ids], weights=[w0, w1, w2])
+                axis = "3축(HyDE)"
+            elif hyde_doc:
+                extra_ids = _hybrid_search(hyde_doc)
+                rrf = rrf_score([original_ids, extra_ids], weights=[w0, w1])
+                axis = "2축(HyDE)"
+            elif alt_query:
+                extra_ids = _hybrid_search(alt_query)
+                rrf = rrf_score([original_ids, extra_ids], weights=[w0, w2])
+                axis = "2축(alt)"
+            else:
+                rrf = rrf_score([original_ids])
+                axis = "1축(원본)"
+
+            candidate_ids = list(rrf.keys())[:top_k_retrieve]
             retrieval_results.append({
                 "eid": eid, "msg": msg, "standalone": standalone,
-                "rrf": {}, "candidate_ids": [], "is_science": False,
+                "rrf": rrf, "candidate_ids": candidate_ids, "is_science": True,
             })
-            print(f"  [{eid}] 치챗 — 검색 건너뜀")
-            continue
+            print(f"  [{eid}] 검색 완료 — {axis} 후보 {len(candidate_ids)}개")
 
-        original_ids = _hybrid_search(standalone)
+        embed_model = unload_model(embed_model)
+        print("임베딩 모델 언로드 완료\n")
 
-        import re as _re
-        hyde_doc = sq.get("hyde_doc", "") or ""
-        alt_query = sq.get("alt_query", "") or ""
-        # <think> 태그 오염 → 버리지 않고 strip 후 사용
-        if "<think>" in hyde_doc:
-            hyde_doc = _re.sub(r"<think>.*?</think>", "", hyde_doc, flags=_re.DOTALL).strip()
-        if "<think>" in alt_query:
-            alt_query = _re.sub(r"<think>.*?</think>", "", alt_query, flags=_re.DOTALL).strip()
-        if hyde_doc and alt_query:
-            hyde_ids = _hybrid_search(hyde_doc)
-            alt_ids = _hybrid_search(alt_query)
-            rrf = rrf_score([original_ids, hyde_ids, alt_ids], weights=[w0, w1, w2])
-            axis = "3축(HyDE)"
-        elif hyde_doc:
-            extra_ids = _hybrid_search(hyde_doc)
-            rrf = rrf_score([original_ids, extra_ids], weights=[w0, w1])
-            axis = "2축(HyDE)"
-        elif alt_query:
-            extra_ids = _hybrid_search(alt_query)
-            rrf = rrf_score([original_ids, extra_ids], weights=[w0, w2])
-            axis = "2축(alt)"
-        else:
-            rrf = rrf_score([original_ids])
-            axis = "1축(원본)"
+        # ── Phase 2: Reranker로 전체 리랭킹 ─────────────────────────────────
+        print("=== Phase 2: Reranking ===")
+        reranker_cfg = cfg.get("reranker", {})
+        reranker_model_name = reranker_cfg.get("model_name", "Qwen/Qwen3-Reranker-8B")
+        reranker_trust_rc = bool(reranker_cfg.get("trust_remote_code", False))
+        print(f"Reranker 로드 중 … ({reranker_model_name})")
+        reranker, reranker_tok = load_reranker(reranker_model_name, trust_remote_code=reranker_trust_rc)
 
-        candidate_ids = list(rrf.keys())[:top_k_retrieve]
-        retrieval_results.append({
-            "eid": eid, "msg": msg, "standalone": standalone,
-            "rrf": rrf, "candidate_ids": candidate_ids, "is_science": True,
-        })
-        print(f"  [{eid}] 검색 완료 — {axis} 후보 {len(candidate_ids)}개")
-
-    embed_model = unload_model(embed_model)
-    print("임베딩 모델 언로드 완료\n")
-
-    # ── Phase 2: Reranker로 전체 리랭킹 ─────────────────────────────────────
-    print("=== Phase 2: Reranking ===")
-    reranker_cfg = cfg.get("reranker", {})
-    reranker_model_name = reranker_cfg.get("model_name", "Qwen/Qwen3-Reranker-8B")
-    reranker_trust_rc = bool(reranker_cfg.get("trust_remote_code", False))
-    print(f"Reranker 로드 중 … ({reranker_model_name})")
-    reranker, reranker_tok = load_reranker(reranker_model_name, trust_remote_code=reranker_trust_rc)
-
-    rerank_results: list[dict] = []
-    for r in retrieval_results:
-        if not r["is_science"]:
-            rerank_results.append({**r, "combined": {}, "topk_ids": []})
-            continue
-        reranker_scores = rerank_with_crossencoder(
-            r["standalone"], r["candidate_ids"], doc_map, reranker, reranker_tok
-        )
-        combined = soft_voting_rerank(r["rrf"], reranker_scores)
-        topk_ids = list(combined.keys())[:top_k_rerank]
-        rerank_results.append({**r, "combined": combined, "topk_ids": topk_ids})
-        print(f"  [{r['eid']}] 리랭킹 완료 — top{top_k_rerank}")
-
-    reranker = unload_model(reranker)
-    print("Reranker 언로드 완료\n")
-
-    llm_select_effective = llm_select
-    if skip_generation and not retrieval_only_llm_select:
-        llm_select_effective = False
-
-    if dump_phase2_eid is not None and dump_phase2_path is not None:
-        _dump_phase2_topk(
-            rerank_results,
-            dump_phase2_eid,
-            dump_phase2_path,
-            skip_generation=skip_generation,
-            llm_select_after_gate=llm_select_effective,
-        )
-
-    # ── Phase 2.5: LLM 최종 문서 선별 (선택) ────────────────────────────────
-    if llm_select_effective:
-        print("=== Phase 2.5: LLM 문서 선별 ===")
-        print("LLM 로드 중 (문서 선별용) …")
-        llm_sel = _load_reasoning_llm(cfg, phase3_backend)
-        for r in rerank_results:
-            if not r["is_science"] or not r["topk_ids"]:
+        rerank_results: list[dict] = []
+        for r in retrieval_results:
+            if not r["is_science"]:
+                rerank_results.append({**r, "combined": {}, "topk_ids": []})
                 continue
-            question = r["msg"][-1]["content"]
-            pool_ids = r["topk_ids"][:_LLM_SELECT_RERANK_POOL]
-            selected = _llm_select_docs(
-                query=question,
-                candidate_ids=pool_ids,
-                doc_map=doc_map,
-                llm=llm_sel,
-                top_k=top_k_submit,
+            reranker_scores = rerank_with_crossencoder(
+                r["standalone"], r["candidate_ids"], doc_map, reranker, reranker_tok
             )
-            r["topk_ids_selected"] = selected
-            print(f"  [{r['eid']}] llm_pool{len(pool_ids)} {pool_ids[:3]}… → {selected}")
-        llm_sel = unload_model(llm_sel)
-        print("LLM(선별) 언로드 완료\n")
+            combined = soft_voting_rerank(r["rrf"], reranker_scores)
+            topk_ids = list(combined.keys())[:top_k_rerank]
+            rerank_results.append({**r, "combined": combined, "topk_ids": topk_ids})
+            print(f"  [{r['eid']}] 리랭킹 완료 — top{top_k_rerank}")
+
+        reranker = unload_model(reranker)
+        print("Reranker 언로드 완료\n")
+
+        # Phase 2 debug dump
+        if dump_phase2_eid is not None and dump_phase2_path is not None:
+            _dump_phase2_topk(
+                rerank_results,
+                dump_phase2_eid,
+                dump_phase2_path,
+                skip_generation=skip_generation,
+                listwise_after_gate=listwise,
+            )
+
+        # ── Phase 2 결과 자동 저장 (Phase 2.5 파라미터 재실험용) ─────────────
+        _p2_out = root / "artifacts" / "phase2_rerank.jsonl"
+        _p2_out.parent.mkdir(parents=True, exist_ok=True)
+        with open(_p2_out, "w", encoding="utf-8") as _f2:
+            for _r in rerank_results:
+                json.dump({
+                    "eval_id":    _r["eid"],
+                    "standalone": _r["standalone"],
+                    "is_science": _r["is_science"],
+                    "msg":        _r["msg"],
+                    "topk_ids":   _r.get("topk_ids", []),
+                    "combined":   _r.get("combined", {}),
+                }, _f2, ensure_ascii=False)
+                _f2.write("\n")
+        print(f"Phase 2 캐시 저장 완료 → {_p2_out} ({len(rerank_results)}건)\n")
+
+    # ── Phase 2.5: Listwise 재정렬 (선택) ────────────────────────────────────
+    if listwise:
+        print("=== Phase 2.5: Listwise Reranking (Solar API) ===")
+        print(f"  파라미터: listwise_n={listwise_n}, preserve_top1={listwise_preserve_top1}, fewshot={listwise_fewshot}")
+        llm_lw = _load_reasoning_llm(cfg, phase3_backend)
+        _lw_applied = 0
+        for r in rerank_results:
+            if not r["is_science"] or not r.get("topk_ids"):
+                r["topk_ids_listwise"] = r.get("topk_ids", [])[:top_k_submit]
+                continue
+            pool_ids = r["topk_ids"][:listwise_n]
+            docs_pool = [{"docid": did, "content": doc_map.get(did, "")} for did in pool_ids]
+            reordered = listwise_rerank(
+                query=r["standalone"],
+                docs=docs_pool,
+                llm=llm_lw,
+                preserve_top1=listwise_preserve_top1,
+                use_fewshot=listwise_fewshot,
+            )
+            r["topk_ids_listwise"] = [d["docid"] for d in reordered[:top_k_submit]]
+            _lw_applied += 1
+            print(f"  [{r['eid']}] pool={pool_ids[:3]}… → {r['topk_ids_listwise']}")
+        llm_lw = unload_model(llm_lw)
+        print(f"LLM(listwise) 언로드 완료 (적용 {_lw_applied}건)\n")
     else:
         for r in rerank_results:
-            r["topk_ids_selected"] = r["topk_ids"][:top_k_submit]
+            r["topk_ids_listwise"] = r.get("topk_ids", [])[:top_k_submit]
 
     # ── Phase 3: LLM으로 전체 답변 생성 ─────────────────────────────────────
     rows_out: list[dict] = []
 
     if skip_generation:
-        # 검색 실험 모드: LLM 없이 topk만 확정, 답변은 placeholder
         print("=== Phase 3: 생략 (--skip-generation) ===")
         print("topk 문서 선별 결과만 출력합니다. 답변은 placeholder로 대체됩니다.")
         for r in rerank_results:
@@ -523,7 +504,7 @@ def run_pipeline(
                 final_ids = []
                 refs = []
             else:
-                final_ids = r["topk_ids_selected"]
+                final_ids = r["topk_ids_listwise"]
                 refs = [
                     {"score": float(r["combined"].get(did, 0.0)), "content": doc_map.get(did, "")}
                     for did in final_ids
@@ -552,7 +533,7 @@ def run_pipeline(
             refs = []
             topk_final: list[str] = []
         else:
-            final_ids = r["topk_ids_selected"]
+            final_ids = r["topk_ids_listwise"]
             context = format_context(final_ids, doc_map, top_k=top_k_submit)
             answer = generate_with_selfcheck(question, context, llm)
             refs = [
@@ -602,18 +583,15 @@ def _load_llm(cfg: dict):
     from llama_index.llms.huggingface import HuggingFaceLLM
     llm_cfg = cfg.get("llm", {})
     base_model = llm_cfg.get("model_name", "Qwen/Qwen3.5-9B")
-    checkpoint = llm_cfg.get("checkpoint") or None  # null/빈 문자열 → None 처리
+    checkpoint = llm_cfg.get("checkpoint") or None
     max_new_tokens = llm_cfg.get("max_new_tokens", 512)
     context_window = llm_cfg.get("context_window", 4096)
 
-    # checkpoint 지정 시: (1) train_sft 가 저장한 merged/ 가 있으면 PEFT 없이 로드
-    # (2) 그 외 PEFT LoRA 어댑터 병합 후 로드
     if checkpoint:
         import os
         from pathlib import Path
         ckpt_path = Path(checkpoint)
         if not ckpt_path.is_absolute():
-            # config 기준 상대경로 → repo root 기준으로 해석
             from ir_rag.config import repo_root_from
             ckpt_path = repo_root_from(Path.cwd()) / ckpt_path
 
@@ -648,7 +626,6 @@ def _load_llm(cfg: dict):
         if merged_subdir.is_dir() and (merged_subdir / "config.json").is_file():
             return _hf_llm_from_dir(merged_subdir, "병합 모델 직접 로드 (PEFT 스킵)")
 
-        # checkpoint 가 이미 "통째 병합 모델" 폴더만 가리키는 경우
         if (ckpt_path / "config.json").is_file() and not (ckpt_path / "adapter_config.json").is_file():
             return _hf_llm_from_dir(ckpt_path, "통합 체크포인트 직접 로드")
 
@@ -657,7 +634,6 @@ def _load_llm(cfg: dict):
             import torch
             from transformers import AutoModelForCausalLM, AutoTokenizer
             peft_cfg = PeftConfig.from_pretrained(str(ckpt_path))
-            # base_model이 config와 다를 수 있으므로 PEFT config 우선
             actual_base = peft_cfg.base_model_name_or_path or base_model
             tokenizer = AutoTokenizer.from_pretrained(
                 actual_base,
@@ -680,7 +656,6 @@ def _load_llm(cfg: dict):
             )
         except Exception as e:
             print(f"  [경고] PEFT 로드 실패 ({e}), base 모델로 fallback: {ckpt_path}")
-            # fallback: checkpoint를 standalone 모델로 시도 (절대경로는 직접 로드)
             import torch
             from transformers import AutoModelForCausalLM, AutoTokenizer
             _tokenizer = AutoTokenizer.from_pretrained(
@@ -736,8 +711,19 @@ def main() -> None:
                         help="Phase 0 건너뜀 — 원본 쿼리로 Phase 1~3만 점검")
     parser.add_argument("--phase0-cache", metavar="CSV",
                         help="Phase 0 캐시 CSV 경로 지정 시 Phase 0을 건너뛰고 해당 파일로 Phase 1~3 실행")
-    parser.add_argument("--llm-select", action="store_true",
-                        help="Phase 2.5 활성화: 리랭커 상위 5개 본문 전체를 LLM에 주고 최종 top-k 선별")
+    parser.add_argument("--phase2-cache", metavar="JSONL",
+                        help="Phase 2 캐시 JSONL 경로 지정 시 Phase 0-2를 건너뛰고 Phase 2.5부터 실행. "
+                             "Reranker 재실행 없이 listwise 파라미터 튜닝에 사용.")
+    parser.add_argument("--listwise", action="store_true",
+                        help="Phase 2.5 활성화: Reranker topk 중 상위 --listwise-n개를 "
+                             "Solar API(LLM)가 listwise 재정렬하여 최종 top-k 선택")
+    parser.add_argument("--listwise-n", type=int, default=10,
+                        help="Listwise 재정렬에 넘기는 Reranker 상위 후보 수 (기본 10)")
+    parser.add_argument("--no-preserve-top1", action="store_false", dest="listwise_preserve_top1",
+                        help="Listwise preserve_top1 비활성 — Reranker top-1을 고정하지 않음 "
+                             "(기본은 top-1 고정 안전 모드)")
+    parser.add_argument("--listwise-fewshot", action="store_true",
+                        help="Listwise 프롬프트에 few-shot 예시 2개 포함")
     parser.add_argument("--multi-field", action="store_true",
                         help="BM25 검색 시 title/keywords/summary/content 멀티필드 쿼리 사용 (F-2 색인 후)")
     parser.add_argument("--skip-generation", action="store_true",
@@ -747,20 +733,21 @@ def main() -> None:
         "--phase0-api",
         choices=("hf", "solar"),
         default="hf",
-        help="Phase 0: standalone·HyDE·alt_query·과학판별 — hf=로컬 LLM, solar=Solar Pro API (SOLAR_API_KEY)",
+        help="Phase 0: standalone·HyDE·alt_query·과학판별 — hf=로컬 LLM, solar=Solar Pro API",
     )
     parser.add_argument(
         "--phase3-api",
         choices=("hf", "solar"),
         default="hf",
-        help="Phase 3: answer 생성 — hf=로컬 LLM, solar=Solar Pro API. --llm-select 시 동일 백엔드 사용.",
+        help="Phase 3: answer 생성 — hf=로컬 LLM, solar=Solar Pro API. "
+             "--listwise 시 Phase 2.5도 동일 백엔드 사용.",
     )
     parser.add_argument(
         "--rrf-weights",
         default=None,
         metavar="W,W,W",
         help="Phase 1에서 standalone / HyDE / alt_query 다축 RRF 가중치 (쉼표로 3개). "
-             "예: 0.5,0.25,0.25. 기본은 균등 1,1,1. 2축일 때는 standalone과 존재하는 축에만 적용.",
+             "예: 0.5,0.25,0.25. 기본은 균등 1,1,1.",
     )
     parser.add_argument(
         "--seed",
@@ -782,19 +769,11 @@ def main() -> None:
         metavar="PATH",
         help="--dump-phase2-eid 와 함께 사용 (미지정 시 artifacts/phase2_dump_eid{EID}.json)",
     )
-    parser.add_argument(
-        "--retrieval-only-llm-select",
-        action="store_true",
-        help="--skip-generation 과 함께 쓸 때 Phase 2.5(--llm-select)는 실행하고 Phase 3만 생략",
-    )
+    parser.set_defaults(listwise_preserve_top1=True)
     args = parser.parse_args()
 
     if not args.placeholder and not args.pipeline:
         parser.error("--placeholder 또는 --pipeline 중 하나를 지정하세요.")
-    if args.retrieval_only_llm_select and not args.skip_generation:
-        parser.error("--retrieval-only-llm-select 는 --skip-generation 과 함께 쓰세요.")
-    if args.retrieval_only_llm_select and not args.llm_select:
-        parser.error("--retrieval-only-llm-select 는 --llm-select 와 함께 쓰세요.")
 
     root = repo_root_from(Path.cwd())
     cfg = load_config(resolve_config_path(root, args.config))
@@ -805,10 +784,15 @@ def main() -> None:
 
     if args.pipeline:
         phase0_cache_path = Path(args.phase0_cache) if args.phase0_cache else None
-        if phase0_cache_path is not None:
+        phase2_cache_path = Path(args.phase2_cache) if args.phase2_cache else None
+
+        if phase2_cache_path is not None:
+            print(f"실제 파이프라인 모드 실행 중 … (Phase 2 캐시: {phase2_cache_path})")
+        elif phase0_cache_path is not None:
             print(f"실제 파이프라인 모드 실행 중 … (Phase 0 캐시: {phase0_cache_path})")
         else:
             print("실제 파이프라인 모드 실행 중 …")
+
         axis_rrf_weights: tuple[float, float, float] | None = None
         if args.rrf_weights:
             parts = [p.strip() for p in args.rrf_weights.split(",") if p.strip()]
@@ -820,12 +804,14 @@ def main() -> None:
                 axis_rrf_weights = (float(parts[0]), float(parts[1]), float(parts[2]))
             except ValueError as e:
                 parser.error(f"--rrf-weights 파싱 실패: {e}")
+
         dump_eid = args.dump_phase2_eid
         dump_path = args.dump_phase2_file
         if dump_eid is not None and dump_path is None:
             dump_path = root / "artifacts" / f"phase2_dump_eid{dump_eid}.json"
         if dump_path is not None and dump_eid is None:
             parser.error("--dump-phase2-file 은 --dump-phase2-eid 와 함께 지정하세요.")
+
         rows_out = run_pipeline(
             cfg, root,
             top_k_retrieve=args.top_k_retrieve,
@@ -836,7 +822,10 @@ def main() -> None:
             bm25_weight=args.bm25_weight,
             dense_weight=args.dense_weight,
             phase0_cache=phase0_cache_path,
-            llm_select=args.llm_select,
+            listwise=args.listwise,
+            listwise_n=args.listwise_n,
+            listwise_preserve_top1=args.listwise_preserve_top1,
+            listwise_fewshot=args.listwise_fewshot,
             use_multi_field=args.multi_field,
             skip_generation=args.skip_generation,
             phase0_backend=args.phase0_api,
@@ -845,7 +834,7 @@ def main() -> None:
             seed=args.seed,
             dump_phase2_eid=dump_eid,
             dump_phase2_path=dump_path,
-            retrieval_only_llm_select=args.retrieval_only_llm_select,
+            phase2_cache=phase2_cache_path,
         )
     else:
         rows_out = []
